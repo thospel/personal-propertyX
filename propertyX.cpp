@@ -1,29 +1,51 @@
 /*
   Compile using something like:
-    g++ -Wall -O3 -march=native -fstrict-aliasing -std=c++14 -g propertyXClient.cpp -lpthread -lev -o propertyXClient
+    g++ -Wall -O3 -march=native -fstrict-aliasing -std=c++14 -g propertyX.cpp -pthread -lev -o propertyX
 
-  Run as:
-    ./propertyXClient [host [port [threads]]]  
+  create a file propertyX.rows.txt containing just ----
+  Run as server:
+    ./propertyX rows [port]
+  Then connect other instantiations of the program as client:
+    ./propertyX [host [port [threads]]]
+  If a client is interrupted just restart it. No work will be lost (but time is)
+  If the server is interrupted rename propertyX.rows.out.txt to propertyX.rows.txt, add a final ---- and restart
+  client signals:
+    USR1: decrease wanted number of threads. Actual decrease only happens
+          when some thread finishes. Then closes connection if wanted == 0
+    USR1: increase wanted number of threads. Takes effect immediately (if less)
+    SYS:  show top row of bits (without the fixed first one). This gives an
+          indication of how far each thread has progressed on its current column
 */
-// asus 10 481s 471
-// nas  10 103s
+// nas  10 78s
+// asus 10 247s
 
-#include <iostream>
-#include <cstring>
-#include <cstdint>
-#include <climits>
-#include <ctgmath>
-#include <cerrno>
-#include <stdexcept>
-#include <limits>
-#include <vector>
-#include <array>
-#include <thread>
-#include <mutex>
-#include <condition_variable>
-#include <chrono>
-#include <atomic>
 #include <algorithm>
+#include <array>
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <deque>
+#include <iomanip>
+#include <iostream>
+#include <fstream>
+#include <sstream>
+#include <limits>
+#include <map>
+#include <mutex>
+#include <set>
+#include <stdexcept>
+#include <string>
+#include <thread>
+#include <type_traits>
+#include <vector>
+
+#include <cctype>
+#include <cerrno>
+#include <climits>
+#include <cstdint>
+#include <cstring>
+#include <ctgmath>
+#include <ctime>
 
 #include <sys/types.h>
 #include <sys/socket.h>
@@ -31,6 +53,8 @@
 #include <fcntl.h>
 #include <netdb.h>
 #include <signal.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
 
 #include <ev++.h>
 
@@ -38,120 +62,262 @@ using namespace std;
 
 #define RESTRICT __restrict__
 
-char const*  HOST = "localhost";
-uint const   PORT = 21453;
-
-bool const DUMMY = false;
 bool const SKIP_FRONT = true;
 bool const SKIP_BACK  = true;
+bool const DEBUG_SET  = false;
+bool const SKIP2      = false;
+bool const INSTRUMENT = false;
+bool const EARLY_MIN  = true;
 
-bool const DEBUG_SET = false;
+char const* HOST = "localhost";
+uint const  PORT = 21453;
 
-uint8_t PROTO_VERSION = 1;
-uint8_t PROGRAM_VERSION = 3;
+int const PERIOD = 5*60;
+// int const PERIOD = 1;
+int  const  BACKLOG = 5;
+char const* TERMINATOR = "----";
+size_t const BLOCK = 65536;
+ev_tstamp const TIMEOUT_GREETING = 10;
+
+char const* PROGRAM_NAME = "propertyX";
+uint8_t PROTO_VERSION   = 2;
+uint8_t PROGRAM_VERSION = 9;
 
 enum {
-    PROTO = 1,
-    ID,
-    PROGRAM,
-    SIZE,
-    INFO,
-    FORK,
-    WORK,
-    RESULT,
-    SOLUTION,
-    IDLE,
-    FINISHED,
+    PROTO = 1,	// Communication protocol version
+    ID,		// client id
+    PROGRAM,	// client program version and nr threads
+    SIZE,	// Number of rows to work on
+    INFO,	// Info about a column (min,max)
+    FORK,	// Tell client to start its threads
+    WORK,	// Give client a column to work on
+    RESULT,	// Tell server how many columns can be gotten starting with WORK
+    SOLUTION,   // New best solution
+    IDLE,	// Server running out of work, client has at least 1 idle thread
+    FINISHED,	// Server completely out of work. Client must exit
+    NR_THREADS,	// Change number of threads for a connection
 };
+
 enum {
-    GET_PROTO = 1*256,
-    GET_SIZE  = 2*256,
+    GET_PROTO   = 1*256,
+
+    // Client states
+    GET_SIZE    = 2*256,
+
+    // Server states
+    GET_ID      = 3*256,
+    GET_PROGRAM = 4*256,
 };
 
 uint const ELEMENTS = 2;
 
-using uint    = unsigned int;
-using Index   = uint32_t;
-using Element = uint64_t;
-using Column  = array<Element, ELEMENTS>;
-using Set     = vector<Column>;
-using Sum     = uint8_t;
-using sec = chrono::seconds;
+using uint     = unsigned int;
+using Index    = uint32_t;
+using Element  = int64_t;
+using uElement = uint64_t;
+using Column   = array<Element, ELEMENTS>;
+using Set      = vector<Column>;
+using Sum      = uint8_t;
+using Sec      = chrono::seconds;
 
-uint const MAX_ROWS = 54;
-uint const COL_FACTOR = (MAX_ROWS+1) | 1;		// 55
-uint const ROW_ZERO   = COL_FACTOR/2;			// 27
-uint const ROWS_PER_ELEMENT = CHAR_BIT*sizeof(Element) / log2(COL_FACTOR); // 11
-uint const MAX_COLS = ROWS_PER_ELEMENT * ELEMENTS;	// 22
+uint const MAX_COLS = 54;
+uint const ROW_FACTOR = (MAX_COLS+1) | 1;		// 55
+uint const ROW_ZERO   = ROW_FACTOR/2;			// 27
+uint const ROWS_PER_ELEMENT = CHAR_BIT*sizeof(Element) / log2(ROW_FACTOR); // 11
+uint const MAX_ROWS = ROWS_PER_ELEMENT * ELEMENTS;	// 22
 Element constexpr ELEMENT_FILL(Element v = ROW_ZERO, int n = ROWS_PER_ELEMENT) {
-    return n ? ELEMENT_FILL(v, n-1) * COL_FACTOR + v : 0;
+    return n ? ELEMENT_FILL(v, n-1) * ROW_FACTOR + v : 0;
 }
-Element constexpr POWN(Element v, int n) {
+uElement constexpr POWN(uElement v, int n) {
     return n ? POWN(v, n-1)*v : 1;
 }
-Element const ELEMENT_TOP = POWN(COL_FACTOR, ROWS_PER_ELEMENT -1);
-Element const ELEMENT_MAX = numeric_limits<Element>::max();
-// log2(2 * ELEMENTS * sizeof(Element) * pow(3., cols) / 10)
+uElement const ELEMENT_TOP  = POWN(ROW_FACTOR, ROWS_PER_ELEMENT - 1);
+Element const ELEMENT_MIN = numeric_limits<Element>::min() + ELEMENT_FILL(1);
+Element const ELEMENT_MAX = numeric_limits<Element>::max() - ELEMENT_FILL(1);
+// log2(2 * ELEMENTS * sizeof(Element) * pow(3., rows) / 10)
 
-auto nr_threads = thread::hardware_concurrency();
+// Shared variables
+Index nr_rows, mask_rows, top_row;
+uint rows;
+ev::default_loop loop;
 
-size_t const BLOCK = 65536;
-ev_tstamp const TIMEOUT_GREETING = 10;
-
-chrono::steady_clock::time_point time_start;
+// Client variables
 thread forked;
-mutex mutex_max;
+mutex mutex_info;
 mutex mutex_out;
 Element top_;
-Index nr_columns, mask_columns, top_column;
 uint top_offset_;
-uint cols;
-uint max_rows_ = 1;
+uint max_cols_ = 1;
+
+// Server variables
+ofstream out;
+Index nr_work;
+Index done_work;
+uint period = 0;
+array<uint8_t,   (MAX_COLS + MAX_ROWS - 1 + 7) / 8 * 8> side;
+array<uint8_t, 1+(MAX_COLS + MAX_ROWS - 1 + 7) / 8 * 8> solution;
+
+string time_string() {
+    time_t t = time(NULL);
+    if (t == static_cast<time_t>(-1))
+        throw(system_error(errno, system_category(), "Could not get time"));
+    struct tm tm;
+    if (localtime_r(&t, &tm) == nullptr)
+        throw(runtime_error("Could not get localtime"));
+    char buffer[100];
+    size_t size = strftime(buffer, sizeof(buffer), "%F %T: ", &tm);
+    return string{buffer, size};
+}
 
 class Connection;
 
+struct Instrument {
+    Instrument& operator+=(Instrument const& add) {
+        calls   += add.calls;
+        success += add.success;
+        front   += add.front;
+        back    += add.back;
+        return *this;
+    }
+    uint64_t calls   = 0;
+    uint64_t success = 0;
+    uint64_t front   = 0;
+    uint64_t back    = 0;
+};
+ostream& operator<<(ostream& os, Instrument const& instrument) {
+    os << setw(12) << instrument.calls << " " << setw(12) << instrument.success << " " << setw(12) << instrument.front << " " << setw(12) << instrument.back << " " << static_cast<double>(instrument.success) / instrument.calls;
+    return os;
+}
+
+struct Instruments: public array<Instrument, MAX_COLS> {
+    Instruments& operator+=(Instruments const& add) {
+        for (uint i=0; i<MAX_COLS; ++i) (*this)[i] += add[i];
+        return *this;
+    }
+};
+ostream& operator<<(ostream& os, Instruments const& instruments) {
+    for (uint i=0; i<MAX_COLS; ++i) {
+        auto const& instrument = instruments[i];
+        if (instrument.calls == 0) break;
+        os << setw(2) << i << ":" << instrument << "\n";
+    }
+    return os;
+}
+
 class State {
   public:
-    State(Connection* connection, uint index);
+    using Ptr = unique_ptr<State>;
+
+    State(Connection* connection);
+    State(State const&) = delete;
     ~State();
+    void fork();
+    void got_work(Index col);
+    uint id() const { return id_; }
+    int64_t elapsed() const {
+        auto now = chrono::steady_clock::now();
+        return chrono::duration_cast<Sec>(now-start_).count();
+    }
+    void show() { show_ = 1; }
+    Instruments const& instruments() const { return instruments_; }
+  private:
+
+    class IdBuffer: public stringbuf {
+      public:
+        IdBuffer(uint const& id): id_{id} {}
+        ~IdBuffer() { sync(); };
+        int sync() {
+            if (!str().empty()) {
+                lock_guard<mutex> lock{mutex_out};
+                cout << time_string() << "Worker " << id_ << ": " << str();
+                cout.flush();
+                str("");
+            }
+            return 0;
+        }
+      private:
+        uint const& id_;
+    };
+
+    class IdStream: public ostream {
+      public:
+        IdStream(uint const& id): ostream{&buffer}, buffer{id} {}
+      private:
+        IdBuffer buffer;
+    };
+
     void stop() { io_in_.stop(); }
     void pipe_write(void const* ptr, size_t size);
     void readable(ev::io& watcher, int revents);
-    void got_work(Index col);
-    void fork();
     void worker();
-    uint extend(uint row);
-    // Must be called with mutex_put locked
+    uint extend(uint row, bool zero = true, bool one = true);
     void print(uint rows);
-  private:
-    Column last_;
+
+    Column current_;
     vector<Set> sets;
+    IdStream id_out;
     string pipe_in_;
     Connection* const connection_;
     ev::io io_in_;
     thread thread_;
     condition_variable cv_col;
     mutex mutex_col;
-    atomic<Index> input_col_;
-    atomic<int>   finished_;
-    Index col_, last_col_, last_col_rev_;
-    uint max_row_ = 0;
-    uint index_, count1_;
+    chrono::steady_clock::time_point start_;
+    atomic<Index> input_row_;
+    atomic<int> finished_;
+    atomic<int> show_;
+    Index col_, current_col_, current_col_rev_;
+    uint max_col_ = 0;
+    uint processed_ = 0;
+    uint id_;
     int fd_[2];
-    array<Sum, (MAX_ROWS + MAX_COLS - 1 + 7) / 8 * 8> side;
+    array<Sum, (MAX_COLS + MAX_ROWS - 1 + 7) / 8 * 8> side;
+    Instruments instruments_;
+
+    static uint next_id;
 };
+uint State::next_id = 0;
 
 struct ColInfo {
     uint8_t min=0, max=-1;
 };
 vector<ColInfo> col_info;
 
-inline void max_rows(uint rows) {
-    if (rows <= max_rows_) return;
-    std::lock_guard<mutex> lock(mutex_max);
-    if (rows <= max_rows_) return;
-    max_rows_ = rows;
+struct ResultInfo {
+    // flags
+    static uint8_t const PENDING  = 1;
+    static uint8_t const FINISHED = 2;
+    static uint8_t const PREFER   = 4;
+
+    // max
+    static uint8_t const MAX = numeric_limits<uint8_t>::max();
+
+    ResultInfo(auto mi, auto ma, auto v):
+        min    {static_cast<uint8_t>(mi)},
+        max    {static_cast<uint8_t>(ma)},
+        version{static_cast<uint8_t>(v)},
+        flags  {0} {}
+    ResultInfo(): ResultInfo(0, MAX, 0) {}
+    void prefer()     { flags |=  PREFER; }
+    void un_prefer()  { flags &= ~PREFER; }
+    void pending()    { flags |=  PENDING; }
+    void un_pending() { flags &= ~PENDING; }
+    void finish()     { flags |=  FINISHED; }
+    bool available()   const { return flags  == 0; }
+    bool preferrable() const { return (flags & PREFER) != 0; }
+
+    uint8_t min, max, version, flags;
+};
+
+ostream& operator<<(ostream& os, ResultInfo const& info) {
+    os << static_cast<uint>(info.min) << " " << static_cast<uint>(info.max) << " " << static_cast<uint>(info.version);
+    return os;
 }
+
+vector<ResultInfo> result_info;
+vector<Index>   col_known;
+deque<Index>    col_work;
+deque<Index>    col_prefer;
 
 inline int cmp(auto const& left, auto const& right) {
     for (uint i=0; i<ELEMENTS; ++i) {
@@ -161,21 +327,567 @@ inline int cmp(auto const& left, auto const& right) {
     return 0;
 }
 
+void shift(Column& column, uElement carry = 0) {
+    column[top_offset_] -= (column[top_offset_] + ELEMENT_FILL()) / top_ % ROW_ZERO * top_;
+    carry += ROW_ZERO;
+    int j = ELEMENTS;
+    while (--j >= 0) {
+        uElement v = column[j] + ELEMENT_FILL();
+        auto c = v / ELEMENT_TOP;
+        v = (v - c * ELEMENT_TOP) * ROW_FACTOR + carry;
+        column[j] = v - ELEMENT_FILL();
+        carry = c;
+    }
+}
+
+class TimeBuffer: public stringbuf {
+  public:
+    ~TimeBuffer() { sync(); };
+    int sync() {
+        if (!str().empty()) {
+            cout << time_string() << str();
+            cout.flush();
+            str("");
+        }
+        return 0;
+    }
+};
+
+class TimeStream: public ostream {
+  public:
+    TimeStream(): ostream{&buffer} {}
+  private:
+    TimeBuffer buffer;
+};
+
+class SyncBuffer: public stringbuf {
+  public:
+    ~SyncBuffer() { sync(); };
+    int sync() {
+        if (!str().empty()) {
+            lock_guard<mutex> lock{mutex_out};
+            cout << time_string() << str();
+            cout.flush();
+            str("");
+        }
+        return 0;
+    }
+};
+
+class SyncStream: public ostream {
+  public:
+    SyncStream(): ostream{&buffer} {}
+  private:
+    SyncBuffer buffer;
+};
+
+TimeStream server_out;
+
+// Server: Listen for incoming connection
+class Listener {
+  public:
+    Listener(uint port);
+    ~Listener() { stop(); }
+    int fd() const { return fd_; }
+    void connection(ev::io& watcher, int revents);
+    void start() { watch_.start(fd(), ev::READ); }
+    void stop()  {
+        if (fd_ < 0) return;
+        watch_.stop();
+        close(fd_);
+        fd_ = -1;
+    }
+    void start_timer() {
+        start_ = chrono::steady_clock::now();
+    }
+    int64_t elapsed() const {
+        auto now = chrono::steady_clock::now();
+        return chrono::duration_cast<Sec>(now-start_).count();
+    }
+  private:
+    ev::io watch_;
+    chrono::steady_clock::time_point start_;
+    int fd_;
+};
+
+// Server: Accepted connection from client
+class Accept {
+  public:
+    using Ptr = unique_ptr<Accept>;
+
+    Accept(Listener* listener, int fd);
+    ~Accept();
+    int fd() const { return fd_; }
+    // put*: Send info to client
+    void put(uint type, void const* data, size_t size);
+    void put1(uint type, uint8_t value) { put(type, &value, 1); }
+    void put4(uint type, Index value) {
+        uint8_t message[4];
+        for (int i=0; i<4; ++i) {
+            message[i] = value & 0xff;
+            value >>= 8;
+        }
+        put(type, message, 4);
+    }
+    void put(uint type, string const& str) {
+        put(type, str.data(), str.size());
+    }
+    void put(uint type) { put(type, "", 0); }
+    void put_known(size_t from=0);
+    void put_info(Index index, ResultInfo const& info);
+    void put_work();
+    void peer(string const& peer) { peer_id_ = peer; }
+    int64_t elapsed() const { return listener_->elapsed(); }
+  private:
+    void readable(ev::io& watcher, int revents);
+    void writable(ev::io& watcher, int revents);
+    void timeout_greeting(ev::timer& timer, int revents);
+
+    bool update_info(ResultInfo& info, Index col, uint8_t min, uint8_t max);
+    bool update_info(ResultInfo& info, Index col, uint8_t min);
+    void un_prefer() {
+        for (auto work: work_)
+            result_info[work].un_prefer();
+    }
+    inline static Index get_index(uint8_t const*& ptr) {
+        Index index = static_cast<Index>(ptr[0]) |
+            static_cast<Index>(ptr[1]) <<  8 |
+            static_cast<Index>(ptr[2]) << 16 |
+            static_cast<Index>(ptr[3]) << 24;
+        ptr += 4;
+        return index;
+    }
+
+    // got_*: Received info from client
+    inline void got_proto   (uint8_t const* ptr, size_t length);
+    inline void got_id      (uint8_t const* ptr, size_t length);
+    inline void got_program (uint8_t const* ptr, size_t length);
+    inline void got_info    (uint8_t const* ptr, size_t length);
+    inline void got_result  (uint8_t const* ptr, size_t length);
+    inline void got_solution(uint8_t const* ptr, size_t length);
+    inline void got_threads (uint8_t const* ptr, size_t length);
+
+    set<Index> work_;
+    Listener* const listener_;
+    ev::io io_in_;
+    ev::io io_out_;
+    ev::timer timer_greeting_;
+    string peer_id_;
+    string in_;
+    string out_;
+    uint program_version_ = 0;
+    uint work_max_;
+    uint phase = GET_PROTO;
+    int fd_;
+    bool idle_ = false;
+};
+
+bool Accept::update_info(ResultInfo& info, Index col, uint8_t min, uint8_t max) {
+    if (min <= info.min && max >= info.max) return false;
+    if (info.version == 0)
+        col_known.emplace_back(col);
+    else if (info.version != program_version_) {
+        out << col << " " << info << "\n";
+    }
+    info.version = program_version_;
+    if (min > info.min) {
+        if (min >= max_cols_) {
+            if (min > max_cols_)
+                throw(logic_error("Solution should always precede info"));
+            // min == max_cols_
+            if (info.available()) {
+                // server_out << "Prefer " << col << endl;
+                col_prefer.emplace_back(col);
+            }
+            info.prefer();
+        }
+        info.min = min;
+    }
+    if (max < info.max) info.max = max;
+    out << col << " " << info << endl;
+    return true;
+}
+
+bool Accept::update_info(ResultInfo& info, Index col, uint8_t min) {
+    if (min <= info.min) return false;
+    if (info.version == 0)
+        col_known.emplace_back(col);
+    else if (info.version != program_version_) {
+        out << col << " " << info << "\n";
+    }
+    info.version = program_version_;
+    if (min > info.min) {
+        if (min >= max_cols_) {
+            if (min > max_cols_)
+                throw(logic_error("Solution should always precede info"));
+            if (info.available()) {
+                // server_out << "Prefer " << col << endl;
+                col_prefer.emplace_back(col);
+            }
+            info.prefer();
+        }
+        info.min = min;
+    }
+    out << col << " " << info << endl;
+    return true;
+}
+
+set<int> accepted_idle;
+map<uint,Accept::Ptr> accepted;
+
+void Accept::timeout_greeting(ev::timer& timer, int revents) {
+    server_out << "Accept " << fd() << " (" << peer_id_ << ") greeting timed out" << endl;
+    accepted.erase(fd());
+}
+
+void Accept::got_proto(uint8_t const* ptr, size_t length) {
+    if (length != 1)
+        throw(logic_error("Invalid proto length " + to_string(length)));
+
+    if (*ptr != PROTO_VERSION) {
+        server_out << "Server speaks protocol version " << static_cast<uint>(*ptr) <<  " while I speak " << static_cast<uint>(PROTO_VERSION) << endl;
+        accepted.erase(fd());
+        return;
+    }
+    put1(SIZE, rows);
+    put_known();
+    put(FORK);
+}
+
+void Accept::got_id(uint8_t const* ptr, size_t length) {
+    peer_id_.assign(reinterpret_cast<char const*>(ptr), length);
+}
+
+void Accept::got_program(uint8_t const* ptr, size_t length) {
+    if (length != 2)
+        throw(logic_error("Invalid program length " + to_string(length)));
+
+    program_version_ = *ptr++;
+    work_max_        = *ptr;
+    if (program_version_ == 0)
+        throw(logic_error("Invalid program version 0"));
+    if (work_max_ == 0)
+        throw(logic_error("no threads"));
+    server_out << "Peer " << fd() << ": " << peer_id_ << " version " << program_version_ << ", " << work_max_ << " threads" << endl;
+    timer_greeting_.stop();
+    put_work();
+}
+
+void Accept::got_info(uint8_t const* ptr, size_t length) {
+    if (length != 6)
+        throw(logic_error("Invalid info length " + to_string(length)));
+
+    Index col = get_index(ptr);
+    auto& info = result_info.at(col);
+    if (update_info(info, col, ptr[0], ptr[1])) 
+        for (auto& element: accepted) {
+            auto& connection = *element.second;
+            if (&connection == this) continue;
+            connection.put_info(col, info);
+        }
+}
+
+void Accept::got_result(uint8_t const* ptr, size_t length) {
+    if (length != 4)
+        throw(logic_error("Invalid result length " + to_string(length)));
+
+    auto work = get_index(ptr);
+    if (!work_.erase(work))
+        throw(logic_error("Result that was never requested: " + to_string(work)));
+    auto& info = result_info[work];
+    info.un_pending();
+    info.finish();
+    ++done_work;
+
+    put_work();
+
+    uint elapsed_ = elapsed();
+    if (elapsed_ >= period || done_work >= nr_work) {
+        server_out << "col=" << done_work << "/" << nr_work << " (" << static_cast<uint64_t>(100*1000)*done_work/nr_work/1000. << "% " << elapsed_ << " s, avg=" << elapsed_ * 1000 / done_work / 1000. << ")" << endl;
+        period = (elapsed_/PERIOD+1)*PERIOD;
+    }
+
+    // if (done_work >= nr_work) loop.unloop();
+    if (done_work >= nr_work) {
+        listener_->stop();
+        for (auto& element: accepted) {
+            auto& connection = *element.second;
+            connection.put(FINISHED);
+        }
+        server_out << "Finished" << endl;
+    }
+}
+
+void Accept::got_solution(uint8_t const* ptr, size_t length) {
+    if (length < 2)
+        throw(logic_error("Invalid solution length " + to_string(length)));
+
+    auto data = ptr;
+    uint cols = *ptr++;
+    if (cols <= max_cols_) return;
+
+    if (cols > MAX_COLS)
+        throw(logic_error("Got a solution for " + to_string(cols) + " cols"));
+    max_cols_ = cols;
+    memcpy(&solution[0], data, length);
+
+    auto l = length - 1;
+    if (l != (rows+cols-1+7)/8)
+        throw(logic_error("Solution with inconsistent length"));
+    for (uint i=0; l; --l) {
+        uint bits = *ptr++;
+        for (int j=0; j<8; ++j) {
+            side[i++] = bits & 1;
+            bits >>= 1;
+        }
+    }
+    server_out << "rows=" << rows << ",cols=" << cols << " (" << elapsed() << " s)\n";
+    Index col = 0;
+    for (uint r=0; r<rows; ++r) {
+        auto s = &side[rows-1-r];
+        col = col << 1 | *s;
+        for (uint c=0; c<cols; ++c)
+            server_out << static_cast<uint>(*s++) << " ";
+        server_out << "\n";
+    }
+    server_out << "----------" << endl;
+
+    for (auto work: col_prefer) {
+        // server_out << "Unprefer " << work << "\n";
+        result_info[work].un_prefer();
+    }
+    col_prefer.clear();
+    server_out.flush();
+    
+    for (auto& element: accepted) {
+        auto& connection = *element.second;
+        connection.un_prefer();
+        if (&connection != this) connection.put(SOLUTION, data, length);
+    }
+
+    auto& info = result_info.at(col);
+    update_info(info, col, cols);
+}
+
+void Accept::got_threads (uint8_t const* ptr, size_t length) {
+    if (length != 1)
+        throw(logic_error("Invalid threads length " + to_string(length)));
+
+    work_max_ = *ptr;
+    server_out << "Peer " << peer_id_ << " changes number of threads to " << work_max_ << endl;
+    put1(NR_THREADS, work_max_);
+    put_work();
+}
+
+void Accept::readable(ev::io& watcher, int revents) {
+    char buffer[BLOCK];
+    auto rc = read(fd(), buffer, BLOCK);
+    if (rc > 0) {
+        in_.append(buffer, rc);
+        while (in_.size()) {
+            auto ptr = reinterpret_cast<uint8_t const*>(in_.data());
+            size_t wanted = *ptr++;
+            if (wanted > in_.size()) return;
+            size_t length = wanted - 2;
+            switch(*ptr++ | phase) {
+                case GET_PROTO | PROTO:
+                  got_proto(ptr, length);
+                  phase = GET_ID;
+                  break;
+                case GET_ID | ID:
+                  got_id(ptr, length);
+                  phase = GET_PROGRAM;
+                  break;
+                case GET_PROGRAM | PROGRAM:
+                  got_program(ptr, length);
+                  phase = 0;
+                  break;
+                case INFO:
+                  got_info(ptr, length);
+                  break;
+                case RESULT:
+                  got_result(ptr, length);
+                  break;
+                case SOLUTION:
+                  got_solution(ptr, length);
+                  break;
+                case NR_THREADS:
+                  got_threads(ptr, length);
+                  break;
+                default: throw
+                    (range_error("Unknown message type " +
+                                 to_string(static_cast<uint>(ptr[-1])) + " in phase " + to_string(phase >> 8)));
+            }
+            in_.erase(0, wanted);
+        }
+        if (work_max_ || work_.size() || done_work >= nr_work || phase) return;
+        server_out << "No more threads on " << peer_id_ << ". Closing connection";
+    } else if (rc < 0) {
+        if (errno == EWOULDBLOCK || errno == EAGAIN || errno == EINTR) return;
+        auto err = strerror(errno);
+        server_out << "Read error from " << peer_id_ << ":" << err;
+    } else {
+        // Close
+        server_out << "Accept " << fd() << " closed by " << peer_id_;
+    }
+    server_out << endl;
+    accepted.erase(fd());
+}
+
+void Accept::writable(ev::io& watcher, int revents) {
+    size_t size = min(out_.size(), BLOCK);
+    auto rc = write(fd(), out_.data(), size);
+    if (rc > 0) {
+        if (static_cast<size_t>(rc) == out_.size()) {
+            out_.clear();
+            io_out_.stop();
+        } else
+            out_.erase(0, rc);
+        return;
+    }
+    if (rc < 0) {
+        if (errno == EWOULDBLOCK || errno == EAGAIN || errno == EINTR) return;
+        auto err = strerror(errno);
+        server_out << "Write error to " << peer_id_ << ":" << err << endl;
+    } else {
+        // rc == 0
+        server_out << "Zero length write to " << peer_id_ << endl;
+    }
+    accepted.erase(fd());
+}
+
+void Accept::put(uint type, void const* data, size_t size) {
+    if (type >= 256 || type == 0) throw(logic_error("Invalid type"));
+    auto wanted = size+2;
+    if (wanted >= 256) throw(range_error("Data too large"));
+    if (out_.size() == 0) io_out_.start(fd(), ev::WRITE);
+    out_.push_back(wanted);
+    out_.push_back(type);
+    out_.append(reinterpret_cast<char const*>(data), size);
+}
+
+Accept::Accept(Listener* listener, int fd):
+    listener_{listener},
+    fd_{fd} {
+    io_out_.set<Accept, &Accept::writable>(this);
+    io_in_ .set<Accept, &Accept::readable>(this);
+    io_in_ .start(fd_, ev::READ);
+    timer_greeting_.set<Accept, &Accept::timeout_greeting>(this);
+    timer_greeting_.start(TIMEOUT_GREETING);
+}
+
+Accept::~Accept() {
+    io_in_.stop();
+    if (out_.size()) io_out_.stop();
+    close(fd_);
+    accepted_idle.erase(fd_);
+    for (Index work: work_) {
+        col_work.emplace_front(work);
+        auto& info = result_info[work];
+        info.un_pending();
+        if (info.preferrable()) col_prefer.emplace_front(work);
+    }
+    while (accepted_idle.size() && col_work.size()) {
+        int fd = *accepted_idle.begin();
+        Accept& accept = *accepted[fd];
+        accept.put_work();
+    }
+    // fd_ = -1;
+}
+
+void Accept::put_known(size_t from) {
+    uint cols = solution[0];
+    if (cols) {
+        uint bytes = 1+(rows+cols-1+7) / 8;
+        put(SOLUTION, &solution[0], bytes);
+    }
+
+    if (out_.size() == 0 && col_known.size() - from)
+        io_out_.start(fd(), ev::WRITE);
+    out_.reserve(out_.size() + 8 * (col_known.size() - from));
+    size_t to = col_known.size();
+    for (size_t k = from; k < to; ++k) {
+        Index index = col_known[k];
+        out_.push_back(8);
+        out_.push_back(INFO);
+        uint32_t i = index;
+        for (int j=0; j<4; ++j) {
+            out_.push_back(i & 0xff);
+            i >>= 8;
+        }
+        out_.push_back(result_info[index].min);
+        out_.push_back(result_info[index].max);
+    }
+}
+
+void Accept::put_info(Index index, ResultInfo const& info) {
+    if (out_.size() == 0) io_out_.start(fd(), ev::WRITE);
+    out_.push_back(8);
+    out_.push_back(INFO);
+    for (int j=0; j<4; ++j) {
+        out_.push_back(index & 0xff);
+        index >>= 8;
+    }
+    out_.push_back(info.min);
+    out_.push_back(info.max);
+}
+
+void Accept::put_work() {
+    while (col_work.size() && work_.size() < work_max_) {
+        Index work;
+        if (col_prefer.size()) {
+            work = col_prefer.front();
+            col_prefer.pop_front();
+        } else {
+            work = col_work.front();
+            col_work.pop_front();
+            if (!result_info[work].available()) continue;
+        }
+        auto rc = work_.emplace(work);
+        if (!rc.second) throw(logic_error("Duplicate work"));
+        result_info[work].pending();
+
+        if (out_.size() == 0) io_out_.start(fd(), ev::WRITE);
+        out_.push_back(6);
+        out_.push_back(WORK);
+        for (int i=0; i<4; ++i) {
+            out_.push_back(work & 0xff);
+            work >>= 8;
+        }
+        if (!period) {
+            period = PERIOD;
+            listener_->start_timer();
+        }
+    }
+    if (work_.size() >= work_max_) {
+        if (idle_) {
+            accepted_idle.erase(fd());
+            idle_ = false;
+        }
+    } else {
+        if (!idle_) {
+            accepted_idle.emplace(fd());
+            idle_ = true;
+            put(IDLE);
+        }
+     }
+}
+
+// Client: Connection to server
 class Connection {
   public:
-    Connection(string const& host, string const& service);
+    Connection(string const& host, string const& service, uint nr_threads = 1);
     ~Connection() {
-        while (nr_states > 0) {
-            auto& state = states[--nr_states];
-            state.~State();
-        }
-        void* raw_memory = states;
-        operator delete[](raw_memory);
-        // states = nullptr;
+        states.resize(0);
         close(fd_);
         // fd_ = -1;
     }
+    void start() {
+        io_in_ .start(fd_, ev::READ);
+        put1(PROTO, PROTO_VERSION);
+    }
     int fd() const { return fd_; }
+    // put*: Send info to server
     void put(uint type, void const* data, size_t size);
     void put1(uint type, uint8_t value) { put(type, &value, 1); }
     void put4(uint type, Index value) {
@@ -191,26 +903,31 @@ class Connection {
     }
     void put(uint type) { put(type, "", 0); }
     void put_known(Index col);
-    void start() {
-        io_in_ .start(fd_, ev::READ);
-        put1(PROTO, PROTO_VERSION);
+    void idle(State* state) {
+        idle_.emplace_back(state);
     }
+    void drop_idle();
+
+  private:
+    State* new_state();
+    void id_set();
     void stop() {
         io_in_.stop();
         io_out_.stop();
         timer_greeting_.stop();
-        while (nr_states > 0) {
-            auto& state = states[--nr_states];
-            state.~State();
-        }
+        sig_usr1_.stop();
+        sig_usr2_.stop();
+        sig_sys_.stop();
+        instruments_show();
+        states.resize(0);
     }
-    void idle(uint index) {
-        idle_.emplace_back(index);
-    }
-  private:
     void readable(ev::io& watcher, int revents);
     void writable(ev::io& watcher, int revents);
     void timeout_greeting(ev::timer& timer, int revents);
+    void threads_more(ev::sig& watcher, int revents);
+    void threads_less(ev::sig& watcher, int revents);
+    void state_show(ev::sig& watcher, int revents);
+    void instruments_show() const;
 
     inline static Index get_index(uint8_t const*& ptr) {
         Index index = static_cast<Index>(ptr[0]) |
@@ -221,53 +938,56 @@ class Connection {
         return index;
     }
 
+    // got_*: Received info from server
     inline void got_proto   (uint8_t const* ptr, size_t length);
     inline void got_size    (uint8_t const* ptr, size_t length);
     inline void got_info    (uint8_t const* ptr, size_t length);
+    inline void got_threads (uint8_t const* ptr, size_t length);
     inline void got_fork    (uint8_t const* ptr, size_t length);
     inline void got_work    (uint8_t const* ptr, size_t length);
     inline void got_solution(uint8_t const* ptr, size_t length);
     inline void got_idle    (uint8_t const* ptr, size_t length);
     inline void got_finished(uint8_t const* ptr, size_t length);
 
-    vector<uint> idle_;
+    vector<State*> idle_;
     // Sigh, State doesn't work in a std::vector since it is not copy
-    // constructable even though I never copy. Emulate with placement new.
-    State* states = nullptr;
+    // constructable even though I never copy (but resize() implicitely can)
+    vector<State::Ptr> states;
+    SyncStream mutable client_out;
     ev::io io_in_;
     ev::io io_out_;
     ev::timer timer_greeting_;
+    ev::sig sig_usr1_, sig_usr2_, sig_sys_;
     string in_;
     string out_;
     string id;
-    uint nr_states = 0;
     int fd_;
-    int phase = GET_PROTO;
+    uint phase = GET_PROTO;
+    uint nr_threads_;
+    uint wanted_threads_;
+    bool forked_ = false;
 };
 
 ostream& operator<<(ostream& os, Column const& column) {
     for (uint i=0; i<ELEMENTS; ++i) {
-        auto v = column[i];
+        uElement v = column[i] + ELEMENT_FILL();
         for (uint j=0; j<ROWS_PER_ELEMENT; ++j) {
-            auto bit = v / ELEMENT_TOP;
-            cout << " " << bit;
+            uint bit = v / ELEMENT_TOP;
+            os << " " << static_cast<int>(bit - ROW_ZERO);
             v -= bit * ELEMENT_TOP;
-            v *= COL_FACTOR;
+            v *= ROW_FACTOR;
         }
     }
     return os;
 }
 
-int64_t elapsed() {
-    auto now = chrono::steady_clock::now();
-    return chrono::duration_cast<sec>(now-time_start).count();
-}
-
-State::State(Connection* connection, uint index):
+State::State(Connection* connection):
+    id_out{id_},
     connection_{connection},
-    finished_{0} 
+    finished_{0},
+    show_{0}
 {
-    index_ = index;
+    id_ = next_id++;
 
     auto rc = pipe(fd_);
     if (rc)
@@ -292,21 +1012,19 @@ State::State(Connection* connection, uint index):
     io_in_.set<State, &State::readable>(this);
     io_in_.start(fd_[0], ev::READ);
 
-    input_col_ = nr_columns;
+    input_row_ = nr_rows;
 
-    sets.resize(MAX_ROWS+2);
+    sets.resize(MAX_COLS+2);
     for (int i=0; i<2; ++i) {
         sets[i].resize(2);
         for (uint j=0; j < ELEMENTS; ++j) {
-            sets[i][0][j] = ELEMENT_FILL(1);
-            sets[i][1][j] = ELEMENT_MAX - ELEMENT_FILL(1);
+            sets[i][0][j] = ELEMENT_MIN;
+            sets[i][1][j] = ELEMENT_MAX;
         }
     }
     if (DEBUG_SET) {
-        lock_guard<mutex> lock{mutex_out};
-        for (auto const& to: sets[0]) {
-            cout << to << "\n";
-        }
+        for (auto const& to: sets[0]) id_out << to << "\n";
+        id_out.flush();
     }
 }
 
@@ -314,7 +1032,7 @@ State::~State() {
     stop();
     if (thread_.joinable()) {
         finished_  = 1;
-        input_col_ = 0;
+        input_row_ = 0;
         cv_col.notify_one();
         thread_.join();
     }
@@ -326,21 +1044,32 @@ void State::readable(ev::io& watcher, int revents) {
     char buffer[BLOCK];
     auto rc = read(fd_[0], buffer, BLOCK);
     if (rc > 0) {
+        bool idle = false;
         pipe_in_.append(buffer, rc);
         while (pipe_in_.size()) {
-            uint rows = pipe_in_[0] & 0xff;
-            if (rows == 0) {
+            uint cols = pipe_in_[0] & 0xff;
+            if (cols == 1) {
+                if (pipe_in_.size() < 1 + sizeof(Index)) break;
+                Index col;
+                memcpy(&col, pipe_in_.data()+1, sizeof(Index));
+                pipe_in_.erase(0, 1 + sizeof(Index));
+                if (EARLY_MIN && col_info[col].min >= max_cols_) 
+                    connection_->put_known(col);
+            } else if (cols == 0) {
+                ++processed_;
                 connection_->put_known(col_);
                 connection_->put4(RESULT, col_);
-                connection_->idle(index_);
+                connection_->idle(this);
+                idle = true;
                 pipe_in_.erase(0, 1);
-                continue;
+            } else {
+                uint bytes = 1+(rows+cols-1+7) / 8;
+                if (pipe_in_.size() < bytes) break;
+                connection_->put(SOLUTION, pipe_in_.data(), bytes);
+                pipe_in_.erase(0, bytes);
             }
-            uint bytes = 1+(rows+cols-1+7) / 8;
-            if (pipe_in_.size() < bytes) break;
-            connection_->put(SOLUTION, pipe_in_.data(), bytes);
-            pipe_in_.erase(0, bytes);
         }
+        if (idle) connection_->drop_idle();
         return;
     }
     // Any form of pipe closure should be impossible
@@ -351,14 +1080,13 @@ void State::readable(ev::io& watcher, int revents) {
 }
 
 void State::got_work(Index col) {
-    if (col >= nr_columns || col == 0)
+    if (col >= nr_rows || col == 0)
         throw(logic_error("Invalid work " + to_string(col)));
     if (false) {
-        std::lock_guard<mutex> lock(mutex_out);
-        cout << "Driver column " << col << endl;
+        id_out << "Driver column " << col << endl;
     }
-    std::lock_guard<mutex> lock(mutex_col);
-    input_col_ = col;
+    lock_guard<mutex> lock(mutex_col);
+    input_row_ = col;
     cv_col.notify_one();
 }
 
@@ -389,105 +1117,109 @@ void State::fork() {
 
 void State::worker() {
     {
-        std::lock_guard<mutex> lock(mutex_out);
-        cout << "Worker " << index_ << " ready" << endl;
+        lock_guard<mutex> lock(mutex_info);
+        max_col_ = max_cols_;
     }
-    std::unique_lock<std::mutex> lock(mutex_col);
+    std::unique_lock<std::mutex> lock_input(mutex_col);
+
+    id_out << "ready" << endl;
+    start_ = chrono::steady_clock::now();
+
     while (!finished_) {
-        cv_col.wait(lock, [this]{return input_col_ < nr_columns;});
-        col_ = input_col_;
-        if (col_ == 0) {
-            std::lock_guard<mutex> lock(mutex_out);
-            cout << "Worker " << index_ << " exiting" << endl;
-            return;
-        }
-        {
-            std::lock_guard<mutex> lock(mutex_out);
-            cout << "Worker " << index_ << ": Processing " << col_ << " (" << elapsed() << " s)" << endl;
-        }
-        {
-            std::lock_guard<mutex> lock(mutex_max);
-            max_row_ = max_rows_;
-        }
-        last_.fill(0);
-        last_col_ = col_;
-        last_col_rev_ = 0;
-        count1_ = 0;
+        cv_col.wait(lock_input, [this]{return input_row_ < nr_rows;});
+        col_ = input_row_;
+        if (col_ == 0) break;
+        auto total = elapsed();
+        current_.fill(0);
+        current_col_ = col_;
+        current_col_rev_ = 0;
         uint bits = col_;
-        for (uint i=0; i<cols; ++i) {
+        char buffer[MAX_ROWS+1];
+        for (uint i=0; i<rows; ++i) {
             uint bit = bits & 1;
+            buffer[i] = bit ? '1' : '0';
             side[i] = bit;
             bits >>= 1;
-            count1_ += bit;
-            last_col_rev_ = last_col_rev_ << 1 | bit;
-            Element carry = 0;
-            for (uint j=0; j<ELEMENTS; ++j) {
-                auto c = last_[j] % COL_FACTOR;
-                last_[j] = last_[j] / COL_FACTOR + carry * ELEMENT_TOP;
-                if (j == top_offset_ && bit) last_[j] += top_;
-                carry = c;
-            }
+            current_col_rev_ = current_col_rev_ << 1 | bit;
+            shift(current_, bit);
         }
+        buffer[rows] = 0;
+        id_out << "Processing " << buffer << " (" << total << " s" << ", n=" << processed_;
+        if (processed_)
+            id_out << ", avg=" << total * 1000 / processed_ / 1000. << " s";
+        id_out << ")";
         if (false) {
-            std::lock_guard<mutex> lock(mutex_out);
-            cout << "Worker " << index_ << ": rev=" << last_col_rev_ << ", last=" << last_ << endl;
+            id_out << "\nrev=" << current_col_rev_ << ", current=" << current_;
+        }
+        id_out << endl;
+
+        uint m = extend(0);
+        // This is a slight race, but it doesn't hurt
+        // (assuming access to max doesn't tear)
+        if (m < col_info[col_].max && !finished_) {
+            lock_guard<mutex> lock{mutex_info};
+            if (m < col_info[col_].max) col_info[col_].max = m;
         }
 
-        if (DUMMY) {
-            auto& info = col_info[col_];
-            info.min     = 9;
-            info.max     = 12;
-
-            if (col_ <= MAX_ROWS) {
-                uint8_t buffer[20];
-                buffer[0] = col_;
-                buffer[1] = 3;
-                buffer[2] = 64;
-                buffer[3] = 0;
-                pipe_write(buffer, 1+(cols+col_-1+7)/8);
-            }
-
-            sleep(1);
-        } else {
-            uint m = extend(0);
-            // This is a slight race, but it doesn't hurt
-            // (assuming access to max doesn't tear)
-            if (m < col_info[col_].max && !finished_) col_info[col_].max = m;
-        }
-        input_col_ = nr_columns;
+        input_row_ = nr_rows;
         uint8_t data = 0;
         pipe_write(&data, sizeof(data));
     }
+    auto total = elapsed();
+    id_out << "exiting (" << total << " s" << ", n=" << processed_;
+    if (processed_)
+        id_out << ", avg=" << total * 1000 / processed_ / 1000. << " s";
+    id_out << ")" << endl;
 }
 
 void indent(uint row) {
     for (uint i=0; i<row; ++i) cout << "  ";
 }
 
-uint State::extend(uint row) {
-    // cout << "Extend row " << row << " " << static_cast<int>(side[cols+row-1]) << "\n";
-    if (row >= MAX_ROWS) throw(range_error("row out of range"));
+// The actual core of the program:
+//   add one more column and see if it is independent
+uint State::extend(uint col, bool zero, bool one) {
+    // id_out << "Extend col " << col << " " << static_cast<int>(side[rows+col-1]) << "\n";
+    if (col >= MAX_COLS) throw(range_error("col out of range"));
+    auto& instrument = instruments_[col];
+    if (INSTRUMENT) {
+        ++instrument.calls;
+    }
+    if (show_) {
+        show_ = 0;
+        for (uint i=0; i<col; ++i) id_out << (side[rows + i] ? 1 : 0) << " ";
+        id_out << endl;
+    }
 
     if (DEBUG_SET) {
-        std::lock_guard<mutex> lock(mutex_out);
-        indent(row);
-        cout << "last_=" <<   last_ << "\n";
+        lock_guard<mutex> lock(mutex_out);
+        indent(col);
+        cout << "current_=" <<   current_ << ", zero=" << (zero ? 1 : 0) << ", one=" << (one ? 1 : 0) << "\n";
     }
 
     if (SKIP_BACK) {
-        uint m = col_info[last_col_rev_].max;
-        if (m <= row) {
-            // cout << "Worker " << index_ << ": Skip back " << col_ << " (" << elapsed() << " s)" << endl;
-            return row;
+        uint m = col_info[current_col_rev_].max;
+        if (m <= col) {
+            if (INSTRUMENT) ++instrument.back;
+            if (false) {
+                char buffer[MAX_ROWS+1];
+                for (uint i=0; i<rows; ++i) buffer[i] = side[col+i] ? '1' : '0';
+                buffer[rows] = 0;
+                id_out << "Skip back " << buffer << " (" << elapsed() << " s)" << endl;
+            }
+            return col;
         }
     }
     if (SKIP_FRONT) {
-        uint m = col_info[last_col_].max + row;
-        if (m <= max_rows_) {
+        uint m = col_info[current_col_].max + col;
+        if (m <= max_cols_) {
             // Column cannot possibly set a new record
+            if (INSTRUMENT) ++instrument.front;
             if (true) {
-                std::lock_guard<mutex> lock(mutex_out);
-                cout << "Worker " << index_ << ": Skip front " << col_ << " (" << elapsed() << " s)" << endl;
+                char buffer[MAX_ROWS+1];
+                for (uint i=0; i<rows; ++i) buffer[i] = side[col+i] ? '1' : '0';
+                buffer[rows] = 0;
+                id_out << "Skip front " << buffer << " (" << elapsed() << " s)" << endl;
             }
             return m;
         }
@@ -497,112 +1229,206 @@ uint State::extend(uint row) {
 
     // Execute subset sum. The new column is added to set {from} giving {to}
     // {sum} is the other set.
-    Column col_high;
-    for (uint j=0; j<ELEMENTS; ++j) col_high[j] = last_[j] + ELEMENT_FILL();
+    auto current = current_;
 
-    auto const& set_sum  = sets[row + 1];
+    auto const& set_sum  = sets[col + 1];
     // Unclear if this is a win or not (no difference at n=10)
-    if (binary_search(set_sum.begin()+1, set_sum.end()-1, col_high,
-                              [](Column const&left, Column const& right) { return cmp(left, right) < 0; }))
-        return row;
+    // But at least it saves me from having to check set_sum when adding
+    // col_current
+    if (binary_search(set_sum.begin()+1, set_sum.end()-1, current,
+                      [](Column const&left, Column const& right) { return cmp(left, right) < 0; })) {
+        // id_out << "Hit on sum" << endl;
+        return col;
+    }
 
-    auto const& set_from = sets[row];
-    auto ranges = equal_range(set_from.begin()+1, set_from.end()-1, col_high,
+    auto const& set_from = sets[col];
+    auto pos_current = equal_range(set_from.cbegin()+1, set_from.cend()-1, current,
                               [](Column const&left, Column const& right) { return cmp(left, right) < 0; });
-    if (ranges.first != ranges.second) return row;
+    // Early check for in set_from was a slight win but cannot happen anymore
+    // However the position is still needed for the subtraction absolute value
+    if (pos_current.first != pos_current.second)
+        throw(logic_error("Unexpected hit on from"));
 
-    auto      & set_to   = sets[row + 2];
+    // Early check for sum is a loss
+    // if (check_sum(set_from, pos_current.first, current0)) return col;
+
+    auto& set_to = sets[col + 2];
     if (set_to.size() == 0) {
         auto size = 3 * set_from.size() - 3;
         set_to.resize(size);
         for (uint j=0; j<ELEMENTS; ++j) {
-            set_to[0     ][j] = ELEMENT_FILL(1);
-            set_to[size-1][j] = ELEMENT_MAX - ELEMENT_FILL(1);
+            set_to[0     ][j] = ELEMENT_MIN;
+            set_to[size-1][j] = ELEMENT_MAX;
         }
     }
 
-    // 4 way merge: {set_from - last_} (twice), {set_from} and
-    // {set_from + last_}
+    // 4 way merge: {set_from - current} (twice), {set_from} and
+    // {set_from + current}
     Element const* RESTRICT ptr_sum    = &set_sum[2][0];
-    Element const* RESTRICT ptr_low1   = &ranges.first[-1][0];
-    Element const* RESTRICT ptr_low2   = &ranges.second[0][0];
+    Element const* RESTRICT ptr_low1   = &pos_current.first[-1][0];
+    Element const* RESTRICT ptr_low2   = &pos_current.second[0][0];
     Element const* RESTRICT ptr_middle = &set_from[1][0];
-    Element const* RESTRICT ptr_high   = &set_from[1][0];
-    Column col_low1, col_low2, last0;
+    auto from_end = set_from.cend() - 2;
+    Column col_low1, col_low2, current2;
     for (uint j=0; j<ELEMENTS; ++j) {
-        last0[j] = ELEMENT_FILL(2*ROW_ZERO) + last_[j];
-        col_low1[j] = last0[j] - ptr_low1[j];
-        col_low2[j] = *ptr_low2++ - last_[j];
-    }
-    if (false) {
-        std::lock_guard<mutex> lock(mutex_out);
-        indent(row);
-        cout << "last0=" << last0 << "\n";
+        col_low1[j]  = current[j] - ptr_low1[j];
+        col_low2[j]  = *ptr_low2++ - current[j];
+        current2[j]     = current[j]*2;
     }
 
-    Element* ptr_end = &set_to[set_to.size()-1][0];
-    Element* ptr_to  = &set_to[1][0];
     int c;
+    auto pos_from_low2 =
+        lower_bound(pos_current.first, set_from.cend()-1, current2,
+                    [](Column const& left, Column const& right) { return cmp(left, right) < 0; });
+    c = cmp(current2, *pos_from_low2);
+    if (c == 0) {
+        // id_out << "Hit on low2 " << col << endl;
+        return col;
+    }
+    auto skip_begin =
+        (pos_from_low2 - pos_current.first) +
+        (pos_current.first - set_from.cbegin() - 1) * 2;
+    if (false) {
+        lock_guard<mutex> lock(mutex_out);
+        indent(col);
+        cout << "low=" << pos_current.first - set_from.cbegin() - 1 <<
+            ", low2=" << pos_from_low2  - set_from.cbegin() - 1 <<
+            ", skip_begin=" << skip_begin << endl;
+    }
+
+    Element* RESTRICT ptr_to  = &set_to[1][0];
+    Element* RESTRICT ptr_end = ptr_to + skip_begin * ELEMENTS;
     while (ptr_to < ptr_end) {
         if (false) {
-            std::lock_guard<mutex> lock(mutex_out);
-            indent(row);
+            lock_guard<mutex> lock(mutex_out);
+            indent(col);
             cout << "col_low1" << col_low1 << "\n";
-            indent(row);
+            indent(col);
             cout << "col_low2" << col_low2 << "\n";
-            indent(row);
-            cout << "col_high" << col_high << "\n";
         }
 
         c = cmp(col_low1, col_low2);
         if (c == -1) {
             c = cmp(col_low1, ptr_middle);
             if (c == -1) {
-                c = cmp(col_low1, col_high);
-                if (c == -1) {
-                    // cout << "LOW1\n";
-                    ptr_low1 -= ELEMENTS;
-                    for (uint j=0; j<ELEMENTS; ++j) {
-                        *ptr_to++   = col_low1[j];
-                        col_low1[j] = last0[j] - ptr_low1[j];
-                    }
-                    goto SUM;
+                // cout << "LOW1\n";
+                ptr_low1 -= ELEMENTS;
+                for (uint j=0; j<ELEMENTS; ++j) {
+                    *ptr_to++   = col_low1[j];
+                    col_low1[j] = current[j] - ptr_low1[j];
                 }
-                if (c == 1) goto HIGH;
-                // low1 == high
-                // cout << "low1 == high\n";
-                return row;
+                goto SUM_L;
             }
-            if (c ==  1) goto MIDDLE;
+            if (c ==  1) goto MIDDLE_L;
             // low1 == middle
             // cout << "low1 == middle\n";
-            return row;
+            return col;
         }
         if (c ==  1) {
             c = cmp(col_low2, ptr_middle);
             if (c == -1) {
-                c = cmp(col_low2, col_high);
-                if (c == -1) {
-                    // cout << "LOW2\n";
-                    for (uint j=0; j<ELEMENTS; ++j) {
-                        *ptr_to++   = col_low2[j];
-                        col_low2[j] = *ptr_low2++ - last_[j];
-                    }
-                    goto SUM;
+                // cout << "LOW2\n";
+                for (uint j=0; j<ELEMENTS; ++j) {
+                    *ptr_to++   = col_low2[j];
+                    col_low2[j] = *ptr_low2++ - current[j];
                 }
-                if (c == 1) goto HIGH;
-                // low2 == high
-                // cout << "low2 == high\n";
-                return row;
+                goto SUM_L;
             }
-            if (c ==  1) goto MIDDLE;
+            if (c ==  1) goto MIDDLE_L;
             // low2 == middle
             // cout << "low2 == middle\n";
-            return row;
+            return col;
         }
         // low1 == low2
         // cout << "low1 == low2\n";
-        return row;
+        return col;
+
+      SUM_L:
+        for (int j=-static_cast<int>(ELEMENTS); j<0; ++j) {
+            if (ptr_to[j] > ptr_sum[j]) {
+                ptr_sum += ELEMENTS;
+                goto SUM_L;
+            }
+            if (ptr_to[j] < ptr_sum[j]) goto DONE_L;
+        }
+        // sum == to
+        return col;
+
+      MIDDLE_L:
+        // cout << "MIDDLE_L\n";
+        for (uint j=0; j<ELEMENTS; ++j)
+            *ptr_to++ = *ptr_middle++;
+        // {middle} can never be in {sum} or we would already have found
+        // this on the previous level
+        goto DONE_L;
+
+      DONE_L:;
+    }
+
+    Element const* RESTRICT ptr_high   = &set_from[1][0];
+    Column from_high, col_high;
+    for (uint j=0; j<ELEMENTS; ++j) {
+        from_high[j] = (*from_end)[j] - current[j];
+        *ptr_to++ = current[j];
+        col_high[j] = *ptr_high++ + current[j];
+    }
+
+    auto pos_from_high =
+        lower_bound(set_from.cbegin()+1, from_end, from_high,
+                    [](Column const& left, Column const& right) { return cmp(left, right) < 0; });
+    if (true) {
+        // Setting this to false makes the program 10% slower even though 
+        // the compare is never true ????
+        c = cmp(from_high, *pos_from_high);
+        if (c == 0) {
+            // This never happens. Why ?
+            throw(logic_error("Unexpected hit on high"));
+            id_out << "Hit on high" << endl;
+            return col;
+        }
+    }
+    auto skip_end = set_from.cend() - 1 - pos_from_high;
+    if (false) {
+        lock_guard<mutex> lock(mutex_out);
+        indent(col);
+        cout << "end=" << pos_from_high - set_from.cbegin() - 1 <<
+            ", skip_end=" << skip_end << endl;
+    }
+    ptr_end = &set_to[set_to.size()-1][0] - skip_end * ELEMENTS;
+    if (false) {
+        lock_guard<mutex> lock(mutex_out);
+        indent(col);
+        cout << "middle=" << (ptr_end-ptr_to)/ELEMENTS << endl;
+    }
+    while (ptr_to < ptr_end) {
+        if (false) {
+            lock_guard<mutex> lock(mutex_out);
+            indent(col);
+            cout << "col_low2" << col_low2 << "\n";
+            indent(col);
+            cout << "col_high" << col_high << "\n";
+        }
+
+        c = cmp(col_low2, ptr_middle);
+        if (c == -1) {
+            c = cmp(col_low2, col_high);
+            if (c == -1) {
+                // cout << "LOW2\n";
+                for (uint j=0; j<ELEMENTS; ++j) {
+                    *ptr_to++   = col_low2[j];
+                    col_low2[j] = *ptr_low2++ - current[j];
+                }
+                goto SUM;
+            }
+            if (c == 1) goto HIGH;
+            // low2 == high
+            // cout << "low2 == high\n";
+            return col;
+        }
+        if (c ==  1) goto MIDDLE;
+        // low2 == middle
+        // cout << "low2 == middle\n";
+        return col;
 
       MIDDLE:
         // cout << "MIDDLE\n";
@@ -618,13 +1444,13 @@ uint State::extend(uint row) {
         if (c ==  1) goto HIGH;
         // middle == high
         // cout << "middle == high\n";
-        return row;
+        return col;
 
       HIGH:
         // cout << "HIGH0\n";
         for (uint j=0; j<ELEMENTS; ++j) {
             *ptr_to++ = col_high[j];
-            col_high[j] = *ptr_high++ + last_[j];
+            col_high[j] = *ptr_high++ + current[j];
         }
         goto SUM;
 
@@ -637,22 +1463,44 @@ uint State::extend(uint row) {
             if (ptr_to[j] < ptr_sum[j]) goto DONE;
         }
         // sum == to
-        return row;
+        return col;
       DONE:;
     }
+    ptr_high -= ELEMENTS;
+
+    ptr_end = &set_to[set_to.size()-1][0];
+    while (ptr_to < ptr_end) {
+        for (uint j=0; j<ELEMENTS; ++j)
+            *ptr_to++ = *ptr_high++ + current[j];
+      SUM_H:
+        for (int j=-static_cast<int>(ELEMENTS); j<0; ++j) {
+            if (ptr_to[j] > ptr_sum[j]) {
+                ptr_sum += ELEMENTS;
+                goto SUM_H;
+            }
+            if (ptr_to[j] < ptr_sum[j]) goto DONE_H;
+        }
+        // sum == to
+        return col;
+      DONE_H:;
+    }
+
+    // New column is OK
+
+    if (INSTRUMENT) ++instrument.success;
+
     if (DEBUG_SET) {
         lock_guard<mutex> lock{mutex_out};
         for (auto const& to: set_to) {
-            indent(row);
+            indent(col);
             cout << to << "\n";
         }
     }
 
-    auto row1 = row+1;
-    if (row1 > col_info[col_].min) col_info[col_].min = row1;
+    auto col1 = col+1;
     if (false) {
         lock_guard<mutex> lock{mutex_out};
-        for (uint i=0; i<row1+2; ++i) {
+        for (uint i=0; i<col1+2; ++i) {
             cout << "Set " << i << "\n";
             auto& set = sets[i];
             for (auto& column: set)
@@ -660,16 +1508,15 @@ uint State::extend(uint row) {
         }
     }
 
-    if (row1 > max_row_) {
-        max_row_ = row1;
-        lock_guard<mutex> lock{mutex_max};
+    if (col1 >= max_col_) {
+        max_col_ = col1;
+        lock_guard<mutex> lock{mutex_info};
+        if (max_col_ > max_cols_) {
+            max_cols_ = max_col_;
 
-        if (max_row_ > max_rows_) {
-            max_rows_ = max_row_;
-
-            uint8_t buffer[1+(MAX_COLS+MAX_ROWS-1+7)/8];
-            buffer[0] = row1;
-            uint bytes = 1 + (cols+row1-1+7)/8;
+            uint8_t buffer[1+(MAX_ROWS+MAX_COLS-1+7)/8];
+            buffer[0] = col1;
+            uint bytes = 1 + (rows+col1-1+7)/8;
             Sum const* s = &side[0];
             for (uint b=1; b<bytes; ++b, s += 8)
                 buffer[b] = s[0] |
@@ -682,94 +1529,219 @@ uint State::extend(uint row) {
                     s[7] << 7;
             pipe_write(buffer, bytes);
 
-            lock_guard<mutex> lock{mutex_out};
-            cout << "Worker " << index_ << ": cols=" << cols << ",rows=" << row1 << " (" << elapsed() << " s)\n";
-            print(row1);
+            id_out << "rows=" << rows << ",cols=" << col1 << " (" << elapsed() << " s)\n";
+            print(col1);
         } else {
-            max_row_ = max_rows_;
+            max_col_ = max_cols_;
+            auto& info = col_info[current_col_rev_];
+            if (col1 == max_col_ && col1 > info.min) {
+                info.min = col1;
+                static_assert(is_same<decltype(current_col_rev_), Index>::value,
+                              "current_col_rev_ is not of type Index");
+                uint8_t buffer[1 + sizeof(Index)];
+                buffer[0] = 1;
+                memcpy(&buffer[1], &current_col_rev_, sizeof(Index));
+                pipe_write(buffer, sizeof(buffer));
+            }
+        }
+    }
+    if (col1 > col_info[col_].min) {
+        lock_guard<mutex> lock{mutex_info};
+        if (col1 > col_info[col_].min) col_info[col_].min = col1;
+    }
+
+    Index current_col, current_col_rev;
+    if (SKIP_FRONT) {
+        current_col = current_col_;
+        current_col_ >>= 1;
+    }
+    current_col_rev  = current_col_rev_;
+    current_col_rev_ = current_col_rev_ << 1 & mask_rows;
+
+    shift(current_);
+    current2 = current_;
+    shift(current2);
+    Column current22;
+    if (SKIP2) 
+        for (uint j=0; j<ELEMENTS; ++j)
+            current22[j] = current2[j] * 2;
+
+    Set::const_iterator pos_sum, pos_to, pos_to2;
+    uint rc = col;
+    if (zero) {
+        bool ok[2] = { true, true };
+        pos_to = lower_bound(set_to.cbegin()+1, set_to.cend()-1, current2,
+                               [](Column const&left, Column const& right) { return cmp(left, right) < 0; });
+        c = cmp(*pos_to, current2);
+        if (c == 0) {
+            ok[0] = false;
+            ++pos_to;
+        }
+        pos_sum = lower_bound(set_sum.cbegin()+1, set_sum.cend()-1, current2,
+                                [](Column const&left, Column const& right) { return cmp(left, right) < 0; });
+        c = cmp(*pos_sum, current2);
+        if (c == 0) {
+            ok[0] = false;
+            ++pos_sum;
+        }
+        if (SKIP2) {
+            pos_to2 = lower_bound(set_to.cbegin()+1, set_to.cend()-1, current22,
+                                    [](Column const&left, Column const& right) { return cmp(left, right) < 0; });
+            c = cmp(*pos_to2, current22);
+            if (c == 0) {
+                ok[0] = false;
+                ++pos_to2;
+            }
+            current22[ELEMENTS-1] += 2;
+        }
+
+        current2 [ELEMENTS-1] += 1;
+        c = cmp(*pos_to, current2);
+        if (c == 0) {
+            ok[1] = false;
+            ++pos_to;
+        } else {
+            c = cmp(*pos_sum, current2);
+            if (c == 0)
+                ok[1] = false;
+            else if (SKIP2) {
+                c = cmp(*pos_to2, current22);
+                if (c < 0) {
+                    ++pos_to2;
+                    c = cmp(*pos_to2, current22);
+                }
+                if (c == 0) {
+                    ok[1] = false;
+                    ++pos_to2;
+                }
+            }
+        }
+
+        current2[ELEMENTS-1] +=  ROW_FACTOR-1;
+        if (SKIP2) current22[ELEMENTS-1] += (ROW_FACTOR-1) * 2;
+        if (false) {
+            lock_guard<mutex> lock{mutex_out};
+            indent(col);
+            cout << "ok0 = [" << (ok[0] ? 1 : 0) << "," << (ok[1] ? 1 : 0) << "]\n";
+        }
+
+        if (ok[0] || ok[1] || col1 >= max_col_) {
+            side[rows + col] = 0;
+            rc = extend(col1, ok[0], ok[1]);
+        }
+        pos_to  = lower_bound(pos_to, min(pos_to + col1, set_to.cend()-1), current2,
+                                [](Column const&left, Column const& right) { return cmp(left, right) < 0; });
+        pos_sum = lower_bound(pos_sum, min(pos_sum + col1, set_sum.cend()-1), current2,
+                                [](Column const&left, Column const& right) { return cmp(left, right) < 0; });
+        if (SKIP2)
+            pos_to2 = lower_bound(pos_to, min(pos_to + 2*col1+3, set_to.cend()-1), current22,
+                                    [](Column const&left, Column const& right) { return cmp(left, right) < 0; });
+    } else {
+        current2 [ELEMENTS-1] += ROW_FACTOR;
+        pos_to  = lower_bound(set_to.cbegin()+1, set_to.cend()-1, current2,
+                                [](Column const&left, Column const& right) { return cmp(left, right) < 0; });
+        pos_sum = lower_bound(set_sum.cbegin()+1, set_sum.cend()-1, current2,
+                                [](Column const&left, Column const& right) { return cmp(left, right) < 0; });
+        if (SKIP2) {
+            current22[ELEMENTS-1] += ROW_FACTOR * 2;
+            pos_to2 = lower_bound(set_to.cbegin()+1, set_to.cend()-1, current22,
+                                    [](Column const&left, Column const& right) { return cmp(left, right) < 0; });
         }
     }
 
-    auto last     = last_;
-    Index last_col, last_col_rev;
-    if (SKIP_FRONT) last_col = last_col_;
-    if (SKIP_BACK)  last_col_rev = last_col_rev_;
+    if (one) {
+        bool ok[2] = { true, true };
+        c = cmp(*pos_to, current2);
+        if (c == 0) {
+            ok[0] = false;
+            ++pos_to;
+        }
+        c = cmp(*pos_sum, current2);
+        if (c == 0) {
+            ok[0] = false;
+            ++pos_sum;
+        }
+        if (SKIP2) {
+            c = cmp(*pos_to2, current22);
+            if (c == 0) {
+                ok[0] = false;
+                ++pos_to2;
+            }
+            current22[ELEMENTS-1] += 2;
+        }
 
-    Element carry = 0;
-    for (uint j=0; j<ELEMENTS; ++j) {
-        auto c = last_[j] % COL_FACTOR;
-        last_[j] = last_[j] / COL_FACTOR + carry * ELEMENT_TOP;
-        carry = c;
+        current2 [ELEMENTS-1] += 1;
+        c = cmp(*pos_to, current2);
+        if (c == 0) ok[1] = false;
+        else {
+            c = cmp(*pos_sum, current2);
+            if (c == 0) ok[1] = false;
+            else if (SKIP2) {
+                c = cmp(*pos_to2, current22);
+                if (c < 0) {
+                    ++pos_to2;
+                    c = cmp(*pos_to2, current22);
+                }
+                if (c == 0) ok[1] = false;
+            }
+        }
+
+        if (false) {
+            lock_guard<mutex> lock{mutex_out};
+            indent(col);
+            cout << "ok1 = [" << (ok[0] ? 1 : 0) << "," << (ok[1] ? 1 : 0) << "]\n";
+        }
+
+        if (ok[0] || ok[1] || col1 >= max_col_) {
+            if (SKIP_FRONT) current_col_     += top_row;
+            current_col_rev_ += 1;
+            ++current_[ELEMENTS-1];
+            side[rows + col] = 1;
+            uint m = extend(col1, ok[0], ok[1]);
+            if (m > rc) rc = m;
+        }
     }
-    if (SKIP_FRONT) last_col_ >>= 1;
-    if (SKIP_BACK)  last_col_rev_ = last_col_rev_ << 1 & mask_columns;
 
-    // Prefer to balance 0's and 1's
-    uint rc;
-    if (count1_ * 2 > cols + row) {
-        side[cols + row] = 0;
-        rc = extend(row1);
+    current_col_rev_ = current_col_rev;
+    if (SKIP_FRONT) current_col_ = current_col;
+    current_ = current;
 
-        if (SKIP_FRONT) last_col_     += top_column;
-        if (SKIP_BACK)  last_col_rev_ += 1;
-        last_[top_offset_] += top_;
-        side[cols + row] = 1;
-        ++count1_;
-        uint m = extend(row1);
-        if (m > rc) rc = m;
-        --count1_;
-    } else {
-        if (SKIP_FRONT) last_col_     += top_column;
-        if (SKIP_BACK)  last_col_rev_ += 1;
-        last_[top_offset_] += top_;
-        ++count1_;
-        side[cols + row] = 1;
-        rc = extend(row1);
-        --count1_;
-        last_[top_offset_] -= top_;
-        if (SKIP_BACK)  last_col_rev_ -= 1;
-        if (SKIP_FRONT) last_col_     -= top_column;
-
-        side[cols + row] = 0;
-        uint m = extend(row1);
-        if (m > rc) rc = m;
-    }
-
-    if (SKIP_BACK)  last_col_rev_ = last_col_rev;
-    if (SKIP_FRONT) last_col_     = last_col;
-    last_     = last;
-
-    if (false && row1 <= 13) {
-        std::lock_guard<mutex> lock(mutex_out);
-        cout << "Worker " << index_ << ":";
-        for(uint i=cols; i < cols + row1; ++i)
-            cout << " " << static_cast<uint>(side[i]);
-        cout << ": " << rc << endl;
-    }
     return rc;
 }
 
-void State::print(uint rows) {
-    for (auto c=0U; c<cols;c++) {
-        for (auto r=0U; r<rows;r++) {
-            cout << static_cast<uint>(side[cols-1-c+r]) << " ";
+void State::print(uint cols) {
+    for (auto r=0U; r<rows;r++) {
+        for (auto c=0U; c<cols;c++) {
+            id_out << static_cast<uint>(side[rows-1-r+c]) << " ";
         }
-        cout << "\n";
+        id_out << "\n";
     }
-    cout << "----------" << endl;
+    id_out << "----------" << endl;
 }
 
-Connection::Connection(string const& host, string const& service) {
-    {
-        char hostname[100];
-        hostname[sizeof(hostname)-1] = 0;
-        int rc = gethostname(hostname, sizeof(hostname)-1);
-        if (rc) id.assign("Dunno");
-        else id.assign(hostname);
-        id.append(" ");
-        auto pid = getpid();
-        id.append(to_string(pid));
-    }
+void Connection::id_set() {
+    char hostname[100];
+    hostname[sizeof(hostname)-1] = 0;
+    int rc = gethostname(hostname, sizeof(hostname)-1);
+    if (rc) id.assign("Dunno");
+    else id.assign(hostname);
+    id.append(" ");
+    auto pid = getpid();
+    id.append(to_string(pid));
+}
+
+State* Connection::new_state() {
+    State* state = new State(this);
+    states.emplace_back(state);
+    idle_.emplace_back(state);
+    return state;
+}
+
+Connection::Connection(string const& host, string const& service, uint nr_threads) :
+    nr_threads_{nr_threads},
+    wanted_threads_{nr_threads}
+{
+    id_set();
 
     // Resolve address
     struct addrinfo hints, *results;
@@ -826,10 +1798,17 @@ Connection::Connection(string const& host, string const& service) {
         freeaddrinfo(results);
 
         fd_ = fd;
-        io_out_    .set<Connection, &Connection::writable>(this);
-        io_in_     .set<Connection, &Connection::readable>(this);
+        io_out_.set<Connection, &Connection::writable>(this);
+        io_in_ .set<Connection, &Connection::readable>(this);
         timer_greeting_.set<Connection, &Connection::timeout_greeting>(this);
         timer_greeting_.start(TIMEOUT_GREETING);
+        sig_usr1_.set<Connection, &Connection::threads_less>(this);
+        sig_usr1_.start(SIGUSR1);
+        sig_usr2_.set<Connection, &Connection::threads_more>(this);
+        sig_usr2_.start(SIGUSR2);
+        sig_sys_.set<Connection, &Connection::state_show>(this);
+        sig_sys_.start(SIGSYS);
+
         return;
     }
     freeaddrinfo(results);
@@ -837,77 +1816,114 @@ Connection::Connection(string const& host, string const& service) {
 }
 
 void Connection::timeout_greeting(ev::timer& timer, int revents) {
-    cout << "Connection greeting timed out" << endl;
+    client_out << "Connection greeting timed out" << endl;
     stop();
 }
 
+void Connection::drop_idle() {
+    while (states.size() > nr_threads_ && idle_.size()) {
+        State* state = idle_.back();
+        int i = states.size();
+        while (--i >= 0)
+            if (states[i].get() == state) {
+                if (i != static_cast<int>(states.size())-1)
+                    swap(states[i], states[states.size()-1]);
+                idle_.pop_back();
+                states.pop_back();
+                client_out << "Changed number of threads to " << states.size() << endl;
+                goto CONTINUE;
+            }
+        throw(logic_error("idle state is not in state set"));
+      CONTINUE:;
+    }
+}
+
 void Connection::got_proto(uint8_t const* ptr, size_t length) {
+    if (length != 1)
+        throw(logic_error("Invalid proto length " + to_string(length)));
+
     if (*ptr != PROTO_VERSION)
         throw(runtime_error("Server speaks protocol version " + to_string(static_cast<uint>(*ptr)) + " while I speak " + to_string(static_cast<uint>(PROTO_VERSION))));
     put(ID, id);
-    uint8_t message[2] = { PROGRAM_VERSION, static_cast<uint8_t>(nr_threads) };
+    uint8_t message[2] = { PROGRAM_VERSION, static_cast<uint8_t>(nr_threads_) };
     put(PROGRAM, message, sizeof(message));
 }
 
 void Connection::got_size(uint8_t const* ptr, size_t length) {
-    cols = *ptr;
-    if (cols > MAX_COLS) throw(range_error("Cols " + to_string(cols) + " > MAX_COLS=" + to_string(MAX_COLS)));
-    cout << "Client " << id << " starts working on " << cols << " columns" << endl;
+    rows = *ptr;
+    if (rows > MAX_ROWS) throw(range_error("Rows " + to_string(rows) + " > MAX_ROWS=" + to_string(MAX_ROWS)));
+    client_out << "Client " << id << " starts working on " << rows << " rows" << endl;
     timer_greeting_.stop();
 
-    nr_columns = static_cast<Index>(1) << cols;
-    col_info.resize(nr_columns);
+    nr_rows = static_cast<Index>(1) << rows;
+    col_info.resize(nr_rows);
     col_info[0] = ColInfo{1, 1};
-    mask_columns = nr_columns - 1;
-    top_column = nr_columns / 2;
+    mask_rows = nr_rows - 1;
+    top_row = nr_rows / 2;
 
-    top_ = POWN(COL_FACTOR, (cols-1) % ROWS_PER_ELEMENT);
-    top_offset_ = ELEMENTS - 1 - (cols-1) / ROWS_PER_ELEMENT;
+    top_ = POWN(ROW_FACTOR, (rows-1) % ROWS_PER_ELEMENT);
+    top_offset_ = ELEMENTS - 1 - (rows-1) / ROWS_PER_ELEMENT;
 
-    idle_.resize(nr_threads);
-    if (states) throw(logic_error("Multiple states initializations"));
-    void* raw_memory = operator new[](nr_threads * sizeof(State));
-    states = static_cast<State*>(raw_memory);
-    while (nr_states < nr_threads) {
-        new(&states[nr_states]) State(this, nr_states);
-        idle_[nr_states] = nr_states;
-        ++nr_states;
-    }
+    if (states.size()) throw(logic_error("Multiple states initializations"));
+    for (uint i = 0; i < nr_threads_; ++i) new_state();
 }
 
 void Connection::got_info(uint8_t const* ptr, size_t length) {
+    if (length != 6)
+        throw(logic_error("Invalid info length " + to_string(length)));
+
     Index index = get_index(ptr);
     auto& info = col_info.at(index);
-    if (*ptr > info.min) {
-        info.min = *ptr;
-        max_rows(info.min);
+    if (ptr[0] > info.min || ptr[1] < info.max) {
+        lock_guard<mutex> lock{mutex_info};
+        if (ptr[0] > info.min) {
+            info.min = ptr[0];
+            if (ptr[0] > max_cols_) {
+                throw(logic_error("Solution should always precede info"));
+                max_cols_ = ptr[0];
+            }
+        }
+        if (ptr[1] < info.max) info.max = ptr[1];
     }
-    ++ptr;
-    if (*ptr < info.max) info.max = *ptr;
-    // cout << "Got info " << index << " [" << static_cast<uint>(info.min) << ", " << static_cast<uint>(info.max) << "]\n";
+    // client_out << "Got info " << index << " [" << static_cast<uint>(info.min) << ", " << static_cast<uint>(info.max) << "]\n";
 }
 
 void Connection::got_fork(uint8_t const* ptr, size_t length) {
-    for (uint i=0; i<nr_states; ++i) states[i].fork();
+    if (length != 0)
+        throw(logic_error("Invalid fork length " + to_string(length)));
+    if (forked_) throw(logic_error("Multiple forks"));
+
+    for (auto& state: states) state->fork();
+    forked_ = true;
+    if (nr_threads_ != wanted_threads_) put1(NR_THREADS, wanted_threads_);
 }
 
 void Connection::got_work(uint8_t const* ptr, size_t length) {
+    if (length != 4)
+        throw(logic_error("Invalid work length " + to_string(length)));
+
     Index col = get_index(ptr);
     if (!idle_.size()) throw(logic_error("Got work while not idle"));
-    auto idle = idle_.back();
+    auto state = idle_.back();
     idle_.pop_back();
-    states[idle].got_work(col);
+    state->got_work(col);
 }
 
 void Connection::got_solution(uint8_t const* ptr, size_t length) {
-    uint rows = *ptr++;
-    max_rows(rows);
-    if (rows > MAX_ROWS)
-        throw(logic_error("Got a solution for " + to_string(rows) + " rows"));
+    if (length < 2)
+        throw(logic_error("Invalid solution length " + to_string(length)));
 
-    array<uint8_t, (MAX_ROWS + MAX_COLS - 1 + 7) / 8 * 8> matrix;
+    uint cols = *ptr++;
+    if (cols > MAX_COLS)
+        throw(logic_error("Got a solution for " + to_string(cols) + " columns"));
+    if (cols > max_cols_) {
+        lock_guard<mutex> lock{mutex_info};
+        if (cols > max_cols_) max_cols_ = cols;
+    }
+
+    array<uint8_t, (MAX_COLS + MAX_ROWS - 1 + 7) / 8 * 8> matrix;
     auto l = length - 1;
-    if (l != (cols+rows-1+7)/8)
+    if (l != (rows+cols-1+7)/8)
         throw(logic_error("Solution with inconsistent length"));
     for (uint i=0; l; --l) {
         uint bits = *ptr++;
@@ -916,30 +1932,49 @@ void Connection::got_solution(uint8_t const* ptr, size_t length) {
             bits >>= 1;
         }
     }
-    std::lock_guard<mutex> lock(mutex_out);
-    cout << "Some computer found: cols=" << cols << ",rows=" << rows << " (" << elapsed() << " s)\n";
-    for (uint c=0; c<cols; ++c) {
-        auto m = &matrix[cols-1-c];
-        for (uint r=0; r<rows; ++r)
-            cout << static_cast<uint>(*m++) << " ";
-        cout << "\n";
+    client_out << "Some computer found: rows=" << rows << ",cols=" << cols << "\n";
+    for (uint r=0; r<rows; ++r) {
+        auto m = &matrix[rows-1-r];
+        for (uint c=0; c<cols; ++c)
+            client_out << static_cast<uint>(*m++) << " ";
+        client_out << "\n";
     }
-    cout << "----------" << endl;
+    client_out << "----------" << endl;
 }
 
 void Connection::got_idle(uint8_t const* ptr, size_t length) {
+    if (length != 0)
+        throw(logic_error("Invalid idle length " + to_string(length)));
+
     if (idle_.size() == 0)
         throw(logic_error("Idle while working"));
-    std::lock_guard<mutex> lock(mutex_out);
-    cout << "Idle" << endl;
+    client_out << "Idle";
+    for (State* state: idle_) client_out << " " << state->id();
+    client_out << endl;
 }
 
 void Connection::got_finished(uint8_t const* ptr, size_t length) {
-    if (idle_.size() != nr_threads)
+    if (length != 0)
+        throw(logic_error("Invalid finished length " + to_string(length)));
+
+    if (idle_.size() != nr_threads_)
         throw(logic_error("Finished while working"));
     stop();
-    std::lock_guard<mutex> lock(mutex_out);
-    cout << "Finished" << endl;
+    client_out << "Finished" << endl;
+}
+
+void Connection::got_threads (uint8_t const* ptr, size_t length) {
+    if (length != 1)
+        throw(logic_error("Invalid threads length " + to_string(length)));
+
+    if (!forked_) throw(logic_error("Thread change without fork"));
+
+    nr_threads_ = *ptr;
+    while (states.size() < nr_threads_) {
+        new_state()->fork();
+        client_out << "Changed number of threads to " << states.size() << endl;
+    }
+    drop_idle();
 }
 
 void Connection::readable(ev::io& watcher, int revents) {
@@ -959,7 +1994,6 @@ void Connection::readable(ev::io& watcher, int revents) {
                   break;
                 case GET_SIZE | SIZE:
                   got_size(ptr, length);
-                  time_start = chrono::steady_clock::now();
                   phase = 0;
                   break;
                 case INFO:
@@ -980,6 +2014,9 @@ void Connection::readable(ev::io& watcher, int revents) {
                 case FINISHED:
                   got_finished(ptr, length);
                   break;
+                case NR_THREADS:
+                  got_threads(ptr, length);
+                  break;
                 default:
                   throw(range_error("Unknown message type " +
                                     to_string(static_cast<uint>(ptr[-1])) + " in phase " + to_string(phase >> 8)));
@@ -992,15 +2029,12 @@ void Connection::readable(ev::io& watcher, int revents) {
     if (rc < 0) {
         if (errno == EWOULDBLOCK || errno == EAGAIN || errno == EINTR) return;
         auto err = strerror(errno);
-        stop();
-        std::lock_guard<mutex> lock(mutex_out);
-        cout << "Could not read: " << err << endl;
+        client_out << "Could not read: " << err << endl;
     } else {
         // Close
-        stop();
-        std::lock_guard<mutex> lock(mutex_out);
-        cout << "Peer closed connection" << endl;
+        client_out << "Peer closed connection" << endl;
     }
+    stop();
 }
 
 void Connection::writable(ev::io& watcher, int revents) {
@@ -1020,6 +2054,41 @@ void Connection::writable(ev::io& watcher, int revents) {
     }
 }
 
+void Connection::threads_more(ev::sig& watcher, int revents) {
+    if (wanted_threads_ < 255) {
+        ++wanted_threads_;
+        client_out << "Increase wanted number of threads to " << wanted_threads_;
+        if (forked_) put1(NR_THREADS, wanted_threads_);
+    } else
+        client_out << "Wanted number of threads already at maximum 255";
+    client_out << endl;
+}
+
+void Connection::threads_less(ev::sig& watcher, int revents) {
+    if (wanted_threads_ > 0) {
+        --wanted_threads_;
+        client_out << "Decrease wanted number of threads to " << wanted_threads_;
+        if (forked_) put1(NR_THREADS, wanted_threads_);
+    } else
+        client_out << "Wanted number of threads already at minimum 0";
+    client_out << endl;
+}
+
+void Connection::instruments_show() const {
+    if (!INSTRUMENT) return;
+
+    Instruments instruments;
+    for (auto& state: states) instruments += state->instruments();
+    client_out << "\n" << instruments;
+    client_out.flush();
+}
+
+void Connection::state_show(ev::sig& watcher, int revents) {
+    instruments_show();
+    // This has delayed output, so put it last
+    for (auto& state: states) state->show();
+}
+
 void Connection::put(uint type, void const* data, size_t size) {
     if (type >= 256 || type == 0) throw(logic_error("Invalid type"));
     auto wanted = size+2;
@@ -1033,6 +2102,7 @@ void Connection::put(uint type, void const* data, size_t size) {
 void Connection::put_known(Index col) {
     if (out_.size() == 0) io_out_.start(fd(), ev::WRITE);
     auto& info = col_info[col];
+    // client_out << "put_known(" << col << ", " << static_cast<uint>(info.min) << ", " << static_cast<uint>(info.max) << ")" << endl;
     out_.push_back(8);
     out_.push_back(INFO);
     for (int i=0; i<4; ++i) {
@@ -1043,11 +2113,276 @@ void Connection::put_known(Index col) {
     out_.push_back(info.max);
 }
 
-void my_main(int argc, char** argv) {
-    nr_threads = min(nr_threads, 255U);
+Listener::Listener(uint port) {
+    if (port < 1 || port >= 65536)
+        throw(out_of_range("Invalid bind port " + to_string(port)));
 
-    auto host = argc > 1 ? argv[1] : HOST;
-    auto port = argc > 2 ? string{argv[2]} : to_string(PORT);
+    // Create socket
+    int fd = socket(AF_INET6, SOCK_STREAM, 0);
+    if (fd < 0)
+        throw(system_error(errno, system_category(), "Could not create socket"));
+
+    // Set non-blocking
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags < 0) {
+        auto err = errno;
+        close(fd);
+        throw(system_error(err, system_category(), "Could not fcntl"));
+    }
+    flags |= O_NONBLOCK;
+    flags = fcntl(fd, F_SETFL, flags);
+    if (flags < 0) {
+        auto err = errno;
+        close(fd);
+        throw(system_error(err, system_category(), "Could not fcntl"));
+    }
+
+    // Reuse addr
+    int enable = 1;
+    int rc = setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &enable, sizeof(enable));
+    if (rc < 0) {
+        auto err = errno;
+        close(fd);
+        throw(system_error(err, system_category(), "Could not set SO_REUSEADDR"));
+    }
+
+    // Turn off IPV6 only
+    enable = 0;
+    rc = setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &enable, sizeof(enable));
+    if (rc < 0) {
+        auto err = errno;
+        close(fd);
+        throw(system_error(err, system_category(), "Could not unset IPV6_V6ONLY"));
+    }
+
+    // Set keepalive
+    enable = 1;
+    rc = setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &enable, sizeof(enable));
+    if (rc < 0) {
+        auto err = errno;
+        close(fd);
+        throw(system_error(err, system_category(), "Could not set SO_KEEPALIVE"));
+    }
+
+    // Bind
+    struct sockaddr_in6 addr6;
+    addr6.sin6_family   = AF_INET6;
+    addr6.sin6_addr     = in6addr_any;
+    addr6.sin6_port     = htons(port);
+    addr6.sin6_scope_id = 0;
+    rc = bind(fd, reinterpret_cast<struct sockaddr *>(&addr6), sizeof(addr6));
+    if (rc < 0) {
+        auto err = errno;
+        close(fd);
+        throw(system_error(err, system_category(), "Could not bind to port " + to_string(port)));
+    }
+
+    // Listen
+    rc = listen(fd, BACKLOG);
+    if (rc < 0) {
+        auto err = errno;
+        close(fd);
+        throw(system_error(err, system_category(), "Could not listen"));
+    }
+
+    // Create (but do not activate) watch
+    watch_.set<Listener, &Listener::connection>(this);
+
+    fd_ = fd;
+}
+
+void Listener::connection(ev::io& watcher, int revents) {
+    struct sockaddr_in6 addr6;
+    socklen_t size = sizeof(addr6);
+    int fd = accept(fd_, reinterpret_cast<struct sockaddr *>(&addr6), &size);
+    if (fd < 0) {
+        if (errno == EWOULDBLOCK || errno == EAGAIN || errno == EINTR) return;
+        throw(system_error(errno, system_category(), "Could not accept"));
+    }
+
+    if (size != sizeof(addr6)) {
+        close(fd);
+        throw(logic_error("Accepted IPV6 connection but struct sockaddr size does not match"));
+    }
+
+    // Set non-blocking
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags < 0) {
+        auto err = errno;
+        close(fd);
+        throw(system_error(err, system_category(), "Could not fcntl"));
+    }
+    if (!(flags & O_NONBLOCK)) {
+        flags |= O_NONBLOCK;
+        flags = fcntl(fd, F_SETFL, flags);
+        if (flags < 0) {
+            auto err = errno;
+            close(fd);
+            throw(system_error(err, system_category(), "Could not fcntl"));
+        }
+    }
+    char buffer[100];
+    auto ip = inet_ntop(addr6.sin6_family, &addr6.sin6_addr, buffer, sizeof(buffer));
+    if (ip == nullptr) {
+        auto err = errno;
+        close(fd);
+        throw(system_error(err, system_category(), "Could not inet_ntop"));
+    }
+    string peer{ip};
+    peer.append(" ");
+    peer.append(to_string(ntohs(addr6.sin6_port)));
+
+    auto result = accepted.emplace(fd, Accept::Ptr{new Accept(this, fd)});
+    auto& connection = *result.first->second;
+    connection.peer(peer);
+    connection.put1(PROTO, PROTO_VERSION);
+    server_out << "Accept " << fd << " from " << peer << endl;
+}
+
+void input(string const& name) {
+    ifstream in{name};
+    if (!in.is_open())
+        throw(system_error(errno, system_category(), "Could not open " + name));
+    string line;
+    while (getline(in, line)) {
+        if (line == TERMINATOR) {
+            sort(col_known.begin(), col_known.end());
+            for (Index i: col_known)
+                out << i << " " << result_info[i] << "\n";
+            out.flush();
+            return;
+        }
+        istringstream iss{line};
+        int64_t index, min_cols, max_cols, version;
+        iss >> index >> min_cols >> max_cols >> version;
+        if (!iss) throw(runtime_error("File " + name + ": Could not parse: " + line));
+        if (index <= 0 || index >= nr_rows)
+            throw(runtime_error("File " + name + ": Index out of range: " + line));
+        if (min_cols < 0 || min_cols > MAX_COLS)
+            throw(runtime_error("File " + name + ": Min out of range: " + line));
+        if (max_cols < 0 || (max_cols > MAX_COLS && max_cols != ResultInfo::MAX))
+            throw(runtime_error("File " + name + ": Max out of range: " + line));
+        if (version <= 0 || version >= 256)
+            throw(runtime_error("File " + name + ": Version out of range: " + line));
+        if (min_cols > max_cols)
+            throw(runtime_error("File " + name + ": Min > Max: " + line));
+
+        ResultInfo new_info{min_cols,max_cols,version};
+        if (new_info.max > max_cols_ && new_info.max != ResultInfo::MAX)
+            max_cols_ = new_info.max;
+        auto& info = result_info[index];
+        if (info.version == 0) {
+            info = new_info;
+            col_known.emplace_back(index);
+        } else {
+            if (info.version != new_info.version) {
+                out << index << " " << info << "\n";
+                info.version = new_info.version;
+            }
+            if (new_info.min > info.min) info.min = new_info.min;
+            if (new_info.max < info.max) info.max = new_info.max;
+            if (info.min > info.max)
+                throw(runtime_error("File " + name + ": Update sets Min > Max: " + line));
+        }
+        // server_out << "index " << index << ", min " << min_cols << ",max " << max_cols << ", version " << version << endl;
+    }
+    throw(runtime_error("File " + name + " does not end on " + TERMINATOR));
+}
+
+void create_work() {
+    vector<uint> col1;
+    col1.resize(rows);
+
+    uint count1 = (rows+1) / 2;
+    for (uint c = 0; c < count1; ++c) col1[c] = c;
+
+    while (count1) {
+        Index col = 0;
+        for (uint c=0; c<count1; ++c)
+            col |= top_row >> col1[c];
+        if (result_info[col].version == 0)
+            col_work.emplace_back(col);
+
+        uint c = count1;
+        while (c > 0) {
+            --c;
+            auto c1 = ++col1[c];
+            if (c1 <= rows - (count1-c)) {
+                while (++c < count1) col1[c] = ++c1;
+                goto DONE;
+            }
+        }
+        if (count1*2 <= rows) count1 = rows + 1 - count1;
+        else count1 = rows - count1;
+        for (uint c=0; c<count1; ++c) col1[c] = c;
+      DONE:;
+    }
+    nr_work = col_work.size();
+    done_work = 0;
+    solution[0] = 0;
+}
+
+void server(int argc, char** argv) {
+    nr_rows = static_cast<Index>(1) << rows;
+    top_row = nr_rows / 2;
+
+    uint port = PORT;
+    if (argc > 2) {
+        auto i = atol(argv[2]);
+        if (i <= 1)
+            throw(range_error("Port must be > 0"));
+        if (i >= 65536)
+            throw(range_error("Port must be < 65536"));
+        port = i;
+    }
+
+    result_info.resize(nr_rows);
+    result_info[0] = ResultInfo(1, 1, 0);
+
+    stringstream file_in, file_out;
+    file_in  << PROGRAM_NAME << "." << rows << ".txt";
+    file_out << PROGRAM_NAME << "." << rows << ".out.txt";
+    out.open(file_out.str());
+    if (!out.is_open())
+        throw(system_error(errno, system_category(), "Could not create " + file_out.str()));
+    out.exceptions(std::ifstream::failbit | std::ifstream::badbit);
+    input(file_in.str());
+
+    create_work();
+
+    if (col_work.size() == 0) {
+        server_out << "Nothing to be done" << endl;
+    } else {
+        auto rc = signal(SIGPIPE, SIG_IGN);
+        if (rc == SIG_ERR)
+            throw(logic_error("Could not ignore SIG PIPE"));
+
+        Listener listener{port};
+
+        server_out << "Trying " << rows << " rows" << endl;
+
+        listener.start();
+        loop.run(0);
+    }
+
+    out << TERMINATOR << "\n";
+    out.close();
+    {
+        auto in_name  = file_in .str();
+        auto out_name = file_out.str();
+        auto rc = rename(out_name.c_str(), in_name.c_str());
+        if (rc)
+            throw(system_error(errno, system_category(), "Could not rename " + out_name + " to " + in_name));
+    }
+}
+
+void client(int argc, char** argv) {
+    uint nr_threads = min(thread::hardware_concurrency(), 255U);
+
+    auto host = argc > 1 && argv[1][0] ? argv[1] : HOST;
+    auto port = argc > 2 &&
+        argv[2][0] && !(argv[2][0] == '0' && argv[2][1] == 0) ?
+        string{argv[2]} : to_string(PORT);
     if (argc > 3) {
         auto l = atol(argv[3]);
         if (l < 1)   throw(range_error("nr threads must be >= 1"));
@@ -1059,21 +2394,34 @@ void my_main(int argc, char** argv) {
     if (rc == SIG_ERR)
         throw(logic_error("Could not ignore SIG PIPE"));
 
-    Connection connection{host, port};
+    Connection connection{host, port, nr_threads};
 
-    ev::default_loop loop;
     connection.start();
     loop.run(0);
 
-    cout << "Processing finished" << endl;
+    server_out << "Processing finished" << endl;
     return;
 }
 
 int main(int argc, char** argv) {
     try {
-        my_main(argc, argv);
+        bool is_server = false;
+        if (argc > 1) {
+            char* ptr;
+            long i = strtol(argv[1], &ptr, 0);
+            while (isspace(*ptr)) ++ptr;
+            if (*ptr == 0) {
+                if (i < 2) throw(range_error("Rows must be >= 2"));
+                if (i > MAX_ROWS)
+                    throw(range_error("Rows must be <= " + to_string(MAX_ROWS)));
+                rows = i;
+                is_server = true;
+            }
+        }
+        if (is_server) server(argc, argv);
+        else           client(argc, argv);
     } catch(exception& e) {
-        cout << "Error: " << e.what() << endl;
+        server_out << "Error: " << e.what() << endl;
         exit(EXIT_FAILURE);
     }
     exit(EXIT_SUCCESS);
