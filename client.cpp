@@ -54,6 +54,7 @@ struct Instrument {
     uint64_t front   = 0;
     uint64_t back    = 0;
 };
+
 ostream& operator<<(ostream& os, Instrument const& instrument) {
     os << setw(12) << instrument.calls << " " << setw(12) << instrument.success << " " << setw(12) << instrument.front << " " << setw(12) << instrument.back << " " << static_cast<double>(instrument.success) / instrument.calls;
     return os;
@@ -65,6 +66,7 @@ struct Instruments: public array<Instrument, MAX_COLS> {
         return *this;
     }
 };
+
 ostream& operator<<(ostream& os, Instruments const& instruments) {
     for (uint i=0; i<MAX_COLS; ++i) {
         auto const& instrument = instruments[i];
@@ -154,11 +156,11 @@ uint State::next_id = 0;
 struct ColInfo {
     uint8_t min=0, max=-1;
 };
-vector<ColInfo> col_info;
-uint top_offset_;
-Element top_;
-mutex mutex_info;
-Index mask_rows;
+STATIC vector<ColInfo> col_info;
+STATIC uint top_offset_;
+STATIC Element top_;
+STATIC mutex mutex_info;
+STATIC Index mask_rows;
 
 inline int cmp(auto const& left, auto const& right) {
     for (uint i=0; i<ELEMENTS; ++i) {

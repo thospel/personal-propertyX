@@ -31,6 +31,8 @@
 # define COLD
 #endif // __GNUC__
 
+#define STATIC static
+
 uint8_t const PROTO_VERSION = 2;
 
 using uint     = unsigned int;

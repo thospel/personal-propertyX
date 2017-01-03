@@ -3,8 +3,6 @@
 #include <cstdlib>
 #include <cctype>
 
-#include <mutex>
-
 using namespace std;
 
 Index nr_rows, top_row;

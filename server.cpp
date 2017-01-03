@@ -1,7 +1,5 @@
 #include "propertyX.hpp"
 
-using namespace std;
-
 #include <algorithm>
 #include <array>
 #include <deque>
@@ -18,6 +16,8 @@ using namespace std;
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <fcntl.h>
+
+using namespace std;
 
 char const* PROGRAM_NAME = "propertyX";
 char const* TERMINATOR = "----";
@@ -37,15 +37,15 @@ struct ResultInfo {
     uint8_t min, max, version;
 };
 
-ofstream out;
-vector<ResultInfo> result_info;
-vector<Index> col_known;
-deque<Index>    col_work;
-array<uint8_t, 1+(MAX_COLS + MAX_ROWS - 1 + 7) / 8 * 8> solution;
-array<uint8_t,   (MAX_COLS + MAX_ROWS - 1 + 7) / 8 * 8> side;
+STATIC ofstream out;
+STATIC vector<ResultInfo> result_info;
+STATIC vector<Index> col_known;
+STATIC deque<Index>    col_work;
+STATIC array<uint8_t, 1+(MAX_COLS + MAX_ROWS - 1 + 7) / 8 * 8> solution;
+STATIC array<uint8_t,   (MAX_COLS + MAX_ROWS - 1 + 7) / 8 * 8> side;
 
-Index nr_work, done_work;
-uint period = 0;
+STATIC Index nr_work, done_work;
+STATIC uint period = 0;
 
 // Server: Listen for incoming connection
 class Listener {
@@ -153,8 +153,8 @@ class Accept {
     bool idle_ = false;
 };
 
-set<int> accepted_idle;
-map<uint,Accept::Ptr> accepted;
+STATIC set<int> accepted_idle;
+STATIC map<uint,Accept::Ptr> accepted;
 
 Listener::Listener(uint port) {
     if (port < 1 || port >= 65536)
