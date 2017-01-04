@@ -724,12 +724,17 @@ void server(int argc, char** argv) {
 
     stringstream file_in, file_out;
     file_in  << PROGRAM_NAME << "." << rows << ".txt";
-    file_out << PROGRAM_NAME << "." << rows << ".out.txt";
-    out.open(file_out.str());
+    file_out << PROGRAM_NAME << "." << rows << ".tmp.txt";
+    auto const& name_in  = file_in .str();
+    auto const& name_out = file_out.str();
+    
+    out.open(name_out);
     if (!out.is_open())
-        throw(system_error(errno, system_category(), "Could not create " + file_out.str()));
+        throw(system_error(errno, system_category(), "Could not create " + name_out));
     out.exceptions(std::ifstream::failbit | std::ifstream::badbit);
-    input(file_in.str());
+    input(name_in);
+    if (rename(name_out.c_str(), name_in.c_str()) != 0) 
+        throw(system_error(errno, system_category(), "Could not rename " + name_out + " to " + name_in));
 
     create_work();
 
@@ -750,11 +755,4 @@ void server(int argc, char** argv) {
 
     out << TERMINATOR << "\n";
     out.close();
-    {
-        auto in_name  = file_in .str();
-        auto out_name = file_out.str();
-        auto rc = rename(out_name.c_str(), in_name.c_str());
-        if (rc)
-            throw(system_error(errno, system_category(), "Could not rename " + out_name + " to " + in_name));
-    }
 }
