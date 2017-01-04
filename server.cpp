@@ -12,6 +12,7 @@
 #include <unistd.h>
 
 #include <sys/types.h>
+#include <sys/stat.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -37,7 +38,77 @@ struct ResultInfo {
     uint8_t min, max, version;
 };
 
-STATIC ofstream out;
+class FdBuffer: public stringbuf {
+  public:
+    FdBuffer(int fd): fd_{fd} {}
+    FdBuffer(): FdBuffer{-1} {}
+    ~FdBuffer() {
+        if (fd_ >= 0) close();
+    };
+    void fd(int value) {
+        fd_ = value;
+    }
+    void close() {
+        if (fd_ < 0)
+            throw(logic_error("Close on FdBuffer without filedescriptor"));
+        sync();
+        ::close(fd_);
+        fd_ = -1;
+    }
+    void open(string const& pathname,
+              int flags = O_CREAT | O_WRONLY,
+              mode_t mode = 0666) {
+        if (fd_ >= 0)
+            throw(logic_error("Open on FdBuffer with filedescriptor"));
+        fd_ = ::open(pathname.c_str(), flags, mode);
+        if (fd_ < 0)
+            throw(system_error(errno, system_category(),
+                               "Could not open to file " + pathname));
+    }
+    NOINLINE int sync();
+    NOINLINE void fsync();
+  private:
+    int fd_;
+};
+
+int FdBuffer::sync() {
+    if (fd_ < 0)
+        throw(logic_error("Flush on FdBuffer without filedescriptor"));
+
+    string const& s = str();
+    auto size = s.size();
+    auto ptr  = s.data();
+
+    while (size) {
+        auto rc = write(fd_, ptr, min(size, BLOCK));
+        if (rc > 0) {
+            ptr  += rc;
+            size -= rc;
+            continue;
+        }
+        if (rc < 0) {
+            if (errno == EINTR) continue;
+            throw(system_error(errno, system_category(),
+                               "write error"));
+        }
+        // rc == 0
+        throw(logic_error("Zero length write"));
+    }
+    str("");
+    return 0;
+}
+
+void FdBuffer::fsync() {
+    if (fd_ < 0)
+        throw(logic_error("Fsync on FdBuffer without filedescriptor"));
+
+    auto rc = ::fsync(fd_);
+    if (rc < 0)
+        throw(system_error(errno, system_category(), "fsync error"));
+}
+
+STATIC FdBuffer out_buffer;
+STATIC ostream out{&out_buffer};
 STATIC vector<ResultInfo> result_info;
 STATIC vector<Index> col_known;
 STATIC deque<Index>    col_work;
@@ -727,13 +798,11 @@ void server(int argc, char** argv) {
     file_out << PROGRAM_NAME << "." << rows << ".tmp.txt";
     auto const& name_in  = file_in .str();
     auto const& name_out = file_out.str();
-    
-    out.open(name_out);
-    if (!out.is_open())
-        throw(system_error(errno, system_category(), "Could not create " + name_out));
-    out.exceptions(std::ifstream::failbit | std::ifstream::badbit);
+
+    out_buffer.open(name_out);
     input(name_in);
-    if (rename(name_out.c_str(), name_in.c_str()) != 0) 
+    out_buffer.fsync();
+    if (rename(name_out.c_str(), name_in.c_str()) != 0)
         throw(system_error(errno, system_category(), "Could not rename " + name_out + " to " + name_in));
 
     create_work();
@@ -753,6 +822,7 @@ void server(int argc, char** argv) {
         loop.run(0);
     }
 
-    out << TERMINATOR << "\n";
-    out.close();
+    out << TERMINATOR << endl;
+    out_buffer.fsync();
+    out_buffer.close();
 }
