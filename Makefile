@@ -4,6 +4,9 @@ CXX = ccache g++
 
 all: propertyX propertyXCheck propertyXLatticeCheck
 
+server.o client.o propertyX.o: propertyX.hpp
+fd_buffer.o server.o: fd_buffer.hpp
+
 propertyX: propertyX.o
 	$(CXX) $(LDFLAGS) -pthread -lev $^ $(LOADLIBES) $(LDLIBS) -o $@
 
