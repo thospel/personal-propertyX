@@ -1,5 +1,7 @@
 #include "fd_buffer.hpp"
 
+#include <cstdio>
+
 #include <unistd.h>
 #include <sys/types.h>
 #include <sys/stat.h>
@@ -51,6 +53,9 @@ void FdBuffer::close() {
     sync();
     ::close(fd_);
     fd_ = -1;
+    if (tmp_file_)
+        if (unlink(name_.c_str()) != 0)
+            throw(system_error(errno, system_category(), "Could not unlink " + name_));
 }
 
 void FdBuffer::fsync() {
@@ -60,4 +65,35 @@ void FdBuffer::fsync() {
     auto rc = ::fsync(fd_);
     if (rc < 0)
         throw(system_error(errno, system_category(), "fsync error on " + name_));
+}
+
+void FdBuffer::rename(string const& new_name, bool do_fsync, int tmp_file) {
+    if (fd_ < 0)
+        throw(logic_error("Rename on FdBuffer without filedescriptor"));
+
+    if (do_fsync) fsync();
+
+    if (::rename(name_.c_str(), new_name.c_str()) != 0)
+        throw(system_error(errno, system_category(), "Could not rename " + name_ + " to " + new_name));
+    name_ = new_name;
+
+    if (tmp_file >= 0) tmp_file_ = tmp_file > 0;
+
+    if (do_fsync) {
+        auto pos = name_.rfind('/');
+
+        string const dir = pos == string::npos ?
+            "." :
+            name_.substr(0, pos+1);
+        int dir_fd = ::open(dir.c_str(), O_RDONLY);
+        if (dir_fd < 0)
+            throw(system_error(errno, system_category(), "Could not open " + dir));
+        auto rc = ::fsync(dir_fd);
+        if (rc < 0) {
+            auto err = errno;
+            ::close(dir_fd);
+            throw(system_error(err, system_category(), "fsync error on " + dir));
+        }
+        ::close(dir_fd);
+    }
 }

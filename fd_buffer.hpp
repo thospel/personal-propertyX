@@ -13,8 +13,13 @@ class FdBuffer: public streambuf {
   public:
     static size_t BLOCK;
 
-    FdBuffer(string const& name, int fd): name_{name}, block_{BLOCK}, fd_{fd} {}
-    FdBuffer(): FdBuffer{"", -1} {}
+    FdBuffer(string const& name, int fd, bool tmp_file = false) :
+        name_{name},
+        block_{BLOCK},
+        fd_{fd},
+        tmp_file_{tmp_file}
+        {}
+    FdBuffer(bool tmp_file = false): FdBuffer{"", -1, tmp_file} {}
     ~FdBuffer() {
         if (fd_ >= 0) close();
     };
@@ -34,11 +39,13 @@ class FdBuffer: public streambuf {
               mode_t mode = 0666);
     int sync();
     void fsync();
+    void rename(string const& new_name, bool do_fsync = false, int tmp_file = -1);
   private:
     vector<char> buffer_;
     string name_;
     size_t block_;
     int fd_;
+    bool tmp_file_;
 };
 
 #endif // FD_BUFFER_HPP
