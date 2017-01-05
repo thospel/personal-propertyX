@@ -36,7 +36,7 @@ struct ResultInfo {
     uint8_t min, max, version;
 };
 
-STATIC FdBuffer out_buffer;
+STATIC FdBuffer out_buffer(true);
 STATIC ostream out{&out_buffer};
 STATIC vector<ResultInfo> result_info;
 STATIC vector<Index> col_known;
@@ -730,9 +730,7 @@ void server(int argc, char** argv) {
 
     out_buffer.open(name_out);
     input(name_in);
-    out_buffer.fsync();
-    if (rename(name_out.c_str(), name_in.c_str()) != 0)
-        throw(system_error(errno, system_category(), "Could not rename " + name_out + " to " + name_in));
+    out_buffer.rename(name_in, true, false);
 
     create_work();
 
