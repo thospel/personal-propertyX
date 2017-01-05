@@ -38,13 +38,23 @@ struct ResultInfo {
     uint8_t min, max, version;
 };
 
-class FdBuffer: public stringbuf {
+class FdBuffer: public streambuf {
   public:
-    FdBuffer(int fd): fd_{fd} {}
+    FdBuffer(int fd): fd_{fd} {
+        setp(buffer_.begin(), buffer_.end());
+    }
     FdBuffer(): FdBuffer{-1} {}
     ~FdBuffer() {
         if (fd_ >= 0) close();
     };
+    int_type overflow(int_type ch) {
+        if (ch != traits_type::eof()) {
+            *pptr() = ch;
+            pbump(1);
+            if (sync() == 0) return ch;
+        }
+        return traits_type::eof();
+    }
     void fd(int value) {
         fd_ = value;
     }
@@ -68,6 +78,7 @@ class FdBuffer: public stringbuf {
     NOINLINE int sync();
     NOINLINE void fsync();
   private:
+    array<char, BLOCK> buffer_;
     int fd_;
 };
 
@@ -75,15 +86,13 @@ int FdBuffer::sync() {
     if (fd_ < 0)
         throw(logic_error("Flush on FdBuffer without filedescriptor"));
 
-    string const& s = str();
-    auto size = s.size();
-    auto ptr  = s.data();
+    char const* ptr  = pbase();
+    char const* end  = pptr();
 
-    while (size) {
-        auto rc = write(fd_, ptr, min(size, BLOCK));
+    while (ptr < end) {
+        auto rc = write(fd_, ptr, end - ptr);
         if (rc > 0) {
             ptr  += rc;
-            size -= rc;
             continue;
         }
         if (rc < 0) {
@@ -94,7 +103,7 @@ int FdBuffer::sync() {
         // rc == 0
         throw(logic_error("Zero length write"));
     }
-    str("");
+    pbump(pbase() - end);
     return 0;
 }
 
