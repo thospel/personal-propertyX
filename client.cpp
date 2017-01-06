@@ -431,7 +431,7 @@ void State::worker() {
         lock_guard<mutex> lock(mutex_info);
         max_col_ = max_cols_;
     }
-    std::unique_lock<std::mutex> lock_input(mutex_col);
+    unique_lock<mutex> lock_input(mutex_col);
 
     id_out << "ready" << endl;
     start_ = chrono::steady_clock::now();

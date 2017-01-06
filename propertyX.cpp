@@ -1,4 +1,5 @@
 #include "propertyX.hpp"
+#include "log_buffer.hpp"
 
 #include <cstdlib>
 #include <cctype>

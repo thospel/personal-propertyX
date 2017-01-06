@@ -6,6 +6,8 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 
+using namespace std;
+
 size_t FdBuffer::BLOCK = 4096;
 
 int FdBuffer::sync() {
