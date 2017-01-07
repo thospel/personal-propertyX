@@ -16,7 +16,7 @@
     SYS:  show top row of bits (without the fixed first one). This gives an
           indication of how far each thread has progressed on its current column
 */
-// nas  10 78s
+// nas  10 77s
 // asus 10 247s
 
 #include <algorithm>
@@ -60,14 +60,28 @@
 
 using namespace std;
 
-#define RESTRICT __restrict__
+#ifdef __GNUC__
+# define RESTRICT __restrict__
+# define NOINLINE	__attribute__((__noinline__))
+# define LIKELY(x)	__builtin_expect(!!(x),true)
+# define UNLIKELY(x)	__builtin_expect(!!(x),false)
+# define HOT		__attribute__((__hot__))
+# define COLD		__attribute__((__cold__))
+#else // __GNUC__
+# define RESTRICT
+# define NOINLINE
+# define LIKELY(x)	(x)
+# define UNLIKELY(x)	(x)
+# define HOT
+# define COLD
+#endif // __GNUC__
 
 bool const SKIP_FRONT = true;
 bool const SKIP_BACK  = true;
 bool const DEBUG_SET  = false;
 bool const SKIP2      = false;
 bool const INSTRUMENT = false;
-bool const EARLY_MIN  = true;
+bool const EARLY_MIN  = false;
 
 char const* HOST = "localhost";
 uint const  PORT = 21453;
@@ -204,6 +218,42 @@ ostream& operator<<(ostream& os, Instruments const& instruments) {
     return os;
 }
 
+class TimeBuffer: public stringbuf {
+  public:
+    ~TimeBuffer() {
+        sync();
+        flush();
+    };
+    int sync() {
+        if (!str().empty()) {
+            {
+                lock_guard<mutex> lock{mutex_out};
+                full_out << time_string() << str();
+            }
+            str("");
+        }
+        return 0;
+    }
+    static stringstream full_out;
+    static void flush() {
+        if (full_out.str().empty()) return;
+        lock_guard<mutex> lock{mutex_out};
+        cout << full_out.str();
+        cout.flush();
+        full_out.str("");
+    }
+    static void flush(ev::timer &w, int revents) { flush(); }
+};
+stringstream TimeBuffer::full_out;
+
+class TimeStream: public ostream {
+  public:
+    TimeStream(): ostream{&buffer} {}
+  private:
+    TimeBuffer buffer;
+};
+TimeStream timed_out;
+
 class State {
   public:
     using Ptr = unique_ptr<State>;
@@ -228,9 +278,10 @@ class State {
         ~IdBuffer() { sync(); };
         int sync() {
             if (!str().empty()) {
-                lock_guard<mutex> lock{mutex_out};
-                cout << time_string() << "Worker " << id_ << ": " << str();
-                cout.flush();
+                {
+                    lock_guard<mutex> lock{mutex_out};
+                    TimeBuffer::full_out << time_string() << "Worker " << id_ << ": " << str();
+                }
                 str("");
             }
             return 0;
@@ -246,11 +297,12 @@ class State {
         IdBuffer buffer;
     };
 
-    void stop() { io_in_.stop(); }
+    void stop() COLD { io_in_.stop(); }
     void pipe_write(void const* ptr, size_t size);
     void readable(ev::io& watcher, int revents);
     void worker();
-    uint extend(uint row, bool zero = true, bool one = true);
+    NOINLINE void skip_message(uint col, bool front) COLD;
+    NOINLINE uint extend(uint row, bool zero = true, bool one = true) HOT;
     void print(uint rows);
 
     Column current_;
@@ -284,29 +336,14 @@ struct ColInfo {
 vector<ColInfo> col_info;
 
 struct ResultInfo {
-    // flags
-    static uint8_t const PENDING  = 1;
-    static uint8_t const FINISHED = 2;
-    static uint8_t const PREFER   = 4;
-
-    // max
     static uint8_t const MAX = numeric_limits<uint8_t>::max();
-
     ResultInfo(auto mi, auto ma, auto v):
         min    {static_cast<uint8_t>(mi)},
         max    {static_cast<uint8_t>(ma)},
-        version{static_cast<uint8_t>(v)},
-        flags  {0} {}
+        version{static_cast<uint8_t>(v)} {}
     ResultInfo(): ResultInfo(0, MAX, 0) {}
-    void prefer()     { flags |=  PREFER; }
-    void un_prefer()  { flags &= ~PREFER; }
-    void pending()    { flags |=  PENDING; }
-    void un_pending() { flags &= ~PENDING; }
-    void finish()     { flags |=  FINISHED; }
-    bool available()   const { return flags  == 0; }
-    bool preferrable() const { return (flags & PREFER) != 0; }
 
-    uint8_t min, max, version, flags;
+    uint8_t min, max, version;
 };
 
 ostream& operator<<(ostream& os, ResultInfo const& info) {
@@ -317,7 +354,6 @@ ostream& operator<<(ostream& os, ResultInfo const& info) {
 vector<ResultInfo> result_info;
 vector<Index>   col_known;
 deque<Index>    col_work;
-deque<Index>    col_prefer;
 
 inline int cmp(auto const& left, auto const& right) {
     for (uint i=0; i<ELEMENTS; ++i) {
@@ -340,49 +376,6 @@ void shift(Column& column, uElement carry = 0) {
     }
 }
 
-class TimeBuffer: public stringbuf {
-  public:
-    ~TimeBuffer() { sync(); };
-    int sync() {
-        if (!str().empty()) {
-            cout << time_string() << str();
-            cout.flush();
-            str("");
-        }
-        return 0;
-    }
-};
-
-class TimeStream: public ostream {
-  public:
-    TimeStream(): ostream{&buffer} {}
-  private:
-    TimeBuffer buffer;
-};
-
-class SyncBuffer: public stringbuf {
-  public:
-    ~SyncBuffer() { sync(); };
-    int sync() {
-        if (!str().empty()) {
-            lock_guard<mutex> lock{mutex_out};
-            cout << time_string() << str();
-            cout.flush();
-            str("");
-        }
-        return 0;
-    }
-};
-
-class SyncStream: public ostream {
-  public:
-    SyncStream(): ostream{&buffer} {}
-  private:
-    SyncBuffer buffer;
-};
-
-TimeStream server_out;
-
 // Server: Listen for incoming connection
 class Listener {
   public:
@@ -390,10 +383,15 @@ class Listener {
     ~Listener() { stop(); }
     int fd() const { return fd_; }
     void connection(ev::io& watcher, int revents);
-    void start() { watch_.start(fd(), ev::READ); }
+    void start() {
+        watch_.start(fd(), ev::READ);
+        timer_output_.set<TimeBuffer::flush>();
+        timer_output_.start(0, 1);
+    }
     void stop()  {
         if (fd_ < 0) return;
         watch_.stop();
+        timer_output_.stop();
         close(fd_);
         fd_ = -1;
     }
@@ -406,6 +404,7 @@ class Listener {
     }
   private:
     ev::io watch_;
+    ev::timer timer_output_;
     chrono::steady_clock::time_point start_;
     int fd_;
 };
@@ -445,10 +444,6 @@ class Accept {
 
     bool update_info(ResultInfo& info, Index col, uint8_t min, uint8_t max);
     bool update_info(ResultInfo& info, Index col, uint8_t min);
-    void un_prefer() {
-        for (auto work: work_)
-            result_info[work].un_prefer();
-    }
     inline static Index get_index(uint8_t const*& ptr) {
         Index index = static_cast<Index>(ptr[0]) |
             static_cast<Index>(ptr[1]) <<  8 |
@@ -490,19 +485,7 @@ bool Accept::update_info(ResultInfo& info, Index col, uint8_t min, uint8_t max) 
         out << col << " " << info << "\n";
     }
     info.version = program_version_;
-    if (min > info.min) {
-        if (min >= max_cols_) {
-            if (min > max_cols_)
-                throw(logic_error("Solution should always precede info"));
-            // min == max_cols_
-            if (info.available()) {
-                // server_out << "Prefer " << col << endl;
-                col_prefer.emplace_back(col);
-            }
-            info.prefer();
-        }
-        info.min = min;
-    }
+    if (min > info.min) info.min = min;
     if (max < info.max) info.max = max;
     out << col << " " << info << endl;
     return true;
@@ -516,18 +499,7 @@ bool Accept::update_info(ResultInfo& info, Index col, uint8_t min) {
         out << col << " " << info << "\n";
     }
     info.version = program_version_;
-    if (min > info.min) {
-        if (min >= max_cols_) {
-            if (min > max_cols_)
-                throw(logic_error("Solution should always precede info"));
-            if (info.available()) {
-                // server_out << "Prefer " << col << endl;
-                col_prefer.emplace_back(col);
-            }
-            info.prefer();
-        }
-        info.min = min;
-    }
+    if (min > info.min) info.min = min;
     out << col << " " << info << endl;
     return true;
 }
@@ -536,7 +508,7 @@ set<int> accepted_idle;
 map<uint,Accept::Ptr> accepted;
 
 void Accept::timeout_greeting(ev::timer& timer, int revents) {
-    server_out << "Accept " << fd() << " (" << peer_id_ << ") greeting timed out" << endl;
+    timed_out << "Accept " << fd() << " (" << peer_id_ << ") greeting timed out" << endl;
     accepted.erase(fd());
 }
 
@@ -545,7 +517,7 @@ void Accept::got_proto(uint8_t const* ptr, size_t length) {
         throw(logic_error("Invalid proto length " + to_string(length)));
 
     if (*ptr != PROTO_VERSION) {
-        server_out << "Server speaks protocol version " << static_cast<uint>(*ptr) <<  " while I speak " << static_cast<uint>(PROTO_VERSION) << endl;
+        timed_out << "Server speaks protocol version " << static_cast<uint>(*ptr) <<  " while I speak " << static_cast<uint>(PROTO_VERSION) << endl;
         accepted.erase(fd());
         return;
     }
@@ -568,7 +540,7 @@ void Accept::got_program(uint8_t const* ptr, size_t length) {
         throw(logic_error("Invalid program version 0"));
     if (work_max_ == 0)
         throw(logic_error("no threads"));
-    server_out << "Peer " << fd() << ": " << peer_id_ << " version " << program_version_ << ", " << work_max_ << " threads" << endl;
+    timed_out << "Peer " << fd() << ": " << peer_id_ << " version " << program_version_ << ", " << work_max_ << " threads" << endl;
     timer_greeting_.stop();
     put_work();
 }
@@ -579,31 +551,27 @@ void Accept::got_info(uint8_t const* ptr, size_t length) {
 
     Index col = get_index(ptr);
     auto& info = result_info.at(col);
-    if (update_info(info, col, ptr[0], ptr[1])) 
-        for (auto& element: accepted) {
-            auto& connection = *element.second;
-            if (&connection == this) continue;
-            connection.put_info(col, info);
-        }
+    update_info(info, col, ptr[0], ptr[1]);
+    for (auto& element: accepted) {
+        auto& connection = *element.second;
+        if (&connection == this) continue;
+        connection.put_info(col, info);
+    }
 }
 
 void Accept::got_result(uint8_t const* ptr, size_t length) {
     if (length != 4)
         throw(logic_error("Invalid result length " + to_string(length)));
 
-    auto work = get_index(ptr);
-    if (!work_.erase(work))
-        throw(logic_error("Result that was never requested: " + to_string(work)));
-    auto& info = result_info[work];
-    info.un_pending();
-    info.finish();
-    ++done_work;
-
+    auto index = get_index(ptr);
+    if (!work_.erase(index))
+        throw(logic_error("Result that was never requested: " + to_string(index)));
     put_work();
 
+    ++done_work;
     uint elapsed_ = elapsed();
     if (elapsed_ >= period || done_work >= nr_work) {
-        server_out << "col=" << done_work << "/" << nr_work << " (" << static_cast<uint64_t>(100*1000)*done_work/nr_work/1000. << "% " << elapsed_ << " s, avg=" << elapsed_ * 1000 / done_work / 1000. << ")" << endl;
+        timed_out << "col=" << done_work << "/" << nr_work << " (" << static_cast<uint64_t>(100*1000)*done_work/nr_work/1000. << "% " << elapsed_ << " s, avg=" << elapsed_ * 1000 / done_work / 1000. << ")" << endl;
         period = (elapsed_/PERIOD+1)*PERIOD;
     }
 
@@ -614,7 +582,7 @@ void Accept::got_result(uint8_t const* ptr, size_t length) {
             auto& connection = *element.second;
             connection.put(FINISHED);
         }
-        server_out << "Finished" << endl;
+        timed_out << "Finished" << endl;
     }
 }
 
@@ -641,32 +609,23 @@ void Accept::got_solution(uint8_t const* ptr, size_t length) {
             bits >>= 1;
         }
     }
-    server_out << "rows=" << rows << ",cols=" << cols << " (" << elapsed() << " s)\n";
+    timed_out << "rows=" << rows << ",cols=" << cols << " (" << elapsed() << " s)\n";
     Index col = 0;
     for (uint r=0; r<rows; ++r) {
         auto s = &side[rows-1-r];
         col = col << 1 | *s;
         for (uint c=0; c<cols; ++c)
-            server_out << static_cast<uint>(*s++) << " ";
-        server_out << "\n";
+            timed_out << static_cast<uint>(*s++) << " ";
+        timed_out << "\n";
     }
-    server_out << "----------" << endl;
-
-    for (auto work: col_prefer) {
-        // server_out << "Unprefer " << work << "\n";
-        result_info[work].un_prefer();
-    }
-    col_prefer.clear();
-    server_out.flush();
-    
-    for (auto& element: accepted) {
-        auto& connection = *element.second;
-        connection.un_prefer();
-        if (&connection != this) connection.put(SOLUTION, data, length);
-    }
-
+    timed_out << "----------" << endl;
     auto& info = result_info.at(col);
     update_info(info, col, cols);
+
+    for (auto& element: accepted) {
+        auto& connection = *element.second;
+        if (&connection != this) connection.put(SOLUTION, data, length);
+    }
 }
 
 void Accept::got_threads (uint8_t const* ptr, size_t length) {
@@ -674,7 +633,7 @@ void Accept::got_threads (uint8_t const* ptr, size_t length) {
         throw(logic_error("Invalid threads length " + to_string(length)));
 
     work_max_ = *ptr;
-    server_out << "Peer " << peer_id_ << " changes number of threads to " << work_max_ << endl;
+    timed_out << "Peer " << peer_id_ << " changes number of threads to " << work_max_ << endl;
     put1(NR_THREADS, work_max_);
     put_work();
 }
@@ -721,16 +680,16 @@ void Accept::readable(ev::io& watcher, int revents) {
             in_.erase(0, wanted);
         }
         if (work_max_ || work_.size() || done_work >= nr_work || phase) return;
-        server_out << "No more threads on " << peer_id_ << ". Closing connection";
+        timed_out << "No more threads on " << peer_id_ << ". Closing connection";
     } else if (rc < 0) {
         if (errno == EWOULDBLOCK || errno == EAGAIN || errno == EINTR) return;
         auto err = strerror(errno);
-        server_out << "Read error from " << peer_id_ << ":" << err;
+        timed_out << "Read error from " << peer_id_ << ":" << err;
     } else {
         // Close
-        server_out << "Accept " << fd() << " closed by " << peer_id_;
+        timed_out << "Accept " << fd() << " closed by " << peer_id_;
     }
-    server_out << endl;
+    timed_out << endl;
     accepted.erase(fd());
 }
 
@@ -748,10 +707,10 @@ void Accept::writable(ev::io& watcher, int revents) {
     if (rc < 0) {
         if (errno == EWOULDBLOCK || errno == EAGAIN || errno == EINTR) return;
         auto err = strerror(errno);
-        server_out << "Write error to " << peer_id_ << ":" << err << endl;
+        timed_out << "Write error to " << peer_id_ << ":" << err << endl;
     } else {
         // rc == 0
-        server_out << "Zero length write to " << peer_id_ << endl;
+        timed_out << "Zero length write to " << peer_id_ << endl;
     }
     accepted.erase(fd());
 }
@@ -781,12 +740,8 @@ Accept::~Accept() {
     if (out_.size()) io_out_.stop();
     close(fd_);
     accepted_idle.erase(fd_);
-    for (Index work: work_) {
+    for (Index work: work_)
         col_work.emplace_front(work);
-        auto& info = result_info[work];
-        info.un_pending();
-        if (info.preferrable()) col_prefer.emplace_front(work);
-    }
     while (accepted_idle.size() && col_work.size()) {
         int fd = *accepted_idle.begin();
         Accept& accept = *accepted[fd];
@@ -834,18 +789,10 @@ void Accept::put_info(Index index, ResultInfo const& info) {
 
 void Accept::put_work() {
     while (col_work.size() && work_.size() < work_max_) {
-        Index work;
-        if (col_prefer.size()) {
-            work = col_prefer.front();
-            col_prefer.pop_front();
-        } else {
-            work = col_work.front();
-            col_work.pop_front();
-            if (!result_info[work].available()) continue;
-        }
+        auto work = col_work.front();
         auto rc = work_.emplace(work);
         if (!rc.second) throw(logic_error("Duplicate work"));
-        result_info[work].pending();
+        col_work.pop_front();
 
         if (out_.size() == 0) io_out_.start(fd(), ev::WRITE);
         out_.push_back(6);
@@ -915,6 +862,7 @@ class Connection {
         io_in_.stop();
         io_out_.stop();
         timer_greeting_.stop();
+        timer_output_.stop();
         sig_usr1_.stop();
         sig_usr2_.stop();
         sig_sys_.stop();
@@ -953,10 +901,10 @@ class Connection {
     // Sigh, State doesn't work in a std::vector since it is not copy
     // constructable even though I never copy (but resize() implicitely can)
     vector<State::Ptr> states;
-    SyncStream mutable client_out;
     ev::io io_in_;
     ev::io io_out_;
     ev::timer timer_greeting_;
+    ev::timer timer_output_;
     ev::sig sig_usr1_, sig_usr2_, sig_sys_;
     string in_;
     string out_;
@@ -1053,7 +1001,7 @@ void State::readable(ev::io& watcher, int revents) {
                 Index col;
                 memcpy(&col, pipe_in_.data()+1, sizeof(Index));
                 pipe_in_.erase(0, 1 + sizeof(Index));
-                if (EARLY_MIN && col_info[col].min >= max_cols_) 
+                if (EARLY_MIN && col_info[col].min >= max_cols_)
                     connection_->put_known(col);
             } else if (cols == 0) {
                 ++processed_;
@@ -1172,8 +1120,25 @@ void State::worker() {
     id_out << ")" << endl;
 }
 
+NOINLINE Set::const_iterator lower_bound(Set::const_iterator begin,
+                                         Set::const_iterator end,
+                                         Column& column) {
+    return lower_bound(begin, end, column,
+                       [](Column const& left, Column const& right) { return cmp(left, right) < 0; });
+}
+
 void indent(uint row) {
     for (uint i=0; i<row; ++i) cout << "  ";
+}
+
+void State::skip_message(uint col, bool front) {
+    char buffer[MAX_ROWS+1];
+    for (uint i=0; i<rows; ++i) buffer[i] = side[col+i] ? '1' : '0';
+    buffer[rows] = 0;
+    id_out << "Skip front " << buffer << " (" << elapsed() << " s)" << endl;
+    // id_out << (fron ? "Skip front " : "Skip back ");
+    // for (uint i=0; i<rows; ++i) id_out << (side[col+i] ? '1' : '0');
+    // id_out << " (" << elapsed() << " s)" << endl;
 }
 
 // The actual core of the program:
@@ -1199,28 +1164,20 @@ uint State::extend(uint col, bool zero, bool one) {
 
     if (SKIP_BACK) {
         uint m = col_info[current_col_rev_].max;
-        if (m <= col) {
+        if (UNLIKELY(m <= col)) {
             if (INSTRUMENT) ++instrument.back;
-            if (false) {
-                char buffer[MAX_ROWS+1];
-                for (uint i=0; i<rows; ++i) buffer[i] = side[col+i] ? '1' : '0';
-                buffer[rows] = 0;
-                id_out << "Skip back " << buffer << " (" << elapsed() << " s)" << endl;
-            }
+            if (false)
+                skip_message(col, false);
             return col;
         }
     }
     if (SKIP_FRONT) {
         uint m = col_info[current_col_].max + col;
-        if (m <= max_cols_) {
+        if (UNLIKELY(m <= max_cols_)) {
             // Column cannot possibly set a new record
             if (INSTRUMENT) ++instrument.front;
-            if (true) {
-                char buffer[MAX_ROWS+1];
-                for (uint i=0; i<rows; ++i) buffer[i] = side[col+i] ? '1' : '0';
-                buffer[rows] = 0;
-                id_out << "Skip front " << buffer << " (" << elapsed() << " s)" << endl;
-            }
+            if (true)
+                skip_message(col, true);
             return m;
         }
     }
@@ -1243,7 +1200,7 @@ uint State::extend(uint col, bool zero, bool one) {
 
     auto const& set_from = sets[col];
     auto pos_current = equal_range(set_from.cbegin()+1, set_from.cend()-1, current,
-                              [](Column const&left, Column const& right) { return cmp(left, right) < 0; });
+                                   [](Column const&left, Column const& right) { return cmp(left, right) < 0; });
     // Early check for in set_from was a slight win but cannot happen anymore
     // However the position is still needed for the subtraction absolute value
     if (pos_current.first != pos_current.second)
@@ -1278,8 +1235,7 @@ uint State::extend(uint col, bool zero, bool one) {
 
     int c;
     auto pos_from_low2 =
-        lower_bound(pos_current.first, set_from.cend()-1, current2,
-                    [](Column const& left, Column const& right) { return cmp(left, right) < 0; });
+        lower_bound(pos_current.first, set_from.cend()-1, current2);
     c = cmp(current2, *pos_from_low2);
     if (c == 0) {
         // id_out << "Hit on low2 " << col << endl;
@@ -1374,10 +1330,9 @@ uint State::extend(uint col, bool zero, bool one) {
     }
 
     auto pos_from_high =
-        lower_bound(set_from.cbegin()+1, from_end, from_high,
-                    [](Column const& left, Column const& right) { return cmp(left, right) < 0; });
+        lower_bound(set_from.cbegin()+1, from_end, from_high);
     if (true) {
-        // Setting this to false makes the program 10% slower even though 
+        // Setting this to false makes the program 10% slower even though
         // the compare is never true ????
         c = cmp(from_high, *pos_from_high);
         if (c == 0) {
@@ -1562,7 +1517,7 @@ uint State::extend(uint col, bool zero, bool one) {
     current2 = current_;
     shift(current2);
     Column current22;
-    if (SKIP2) 
+    if (SKIP2)
         for (uint j=0; j<ELEMENTS; ++j)
             current22[j] = current2[j] * 2;
 
@@ -1570,23 +1525,20 @@ uint State::extend(uint col, bool zero, bool one) {
     uint rc = col;
     if (zero) {
         bool ok[2] = { true, true };
-        pos_to = lower_bound(set_to.cbegin()+1, set_to.cend()-1, current2,
-                               [](Column const&left, Column const& right) { return cmp(left, right) < 0; });
+        pos_to = lower_bound(set_to.cbegin()+1, set_to.cend()-1, current2);
         c = cmp(*pos_to, current2);
         if (c == 0) {
             ok[0] = false;
             ++pos_to;
         }
-        pos_sum = lower_bound(set_sum.cbegin()+1, set_sum.cend()-1, current2,
-                                [](Column const&left, Column const& right) { return cmp(left, right) < 0; });
+        pos_sum = lower_bound(set_sum.cbegin()+1, set_sum.cend()-1, current2);
         c = cmp(*pos_sum, current2);
         if (c == 0) {
             ok[0] = false;
             ++pos_sum;
         }
         if (SKIP2) {
-            pos_to2 = lower_bound(set_to.cbegin()+1, set_to.cend()-1, current22,
-                                    [](Column const&left, Column const& right) { return cmp(left, right) < 0; });
+            pos_to2 = lower_bound(set_to.cbegin()+1, set_to.cend()-1, current22);
             c = cmp(*pos_to2, current22);
             if (c == 0) {
                 ok[0] = false;
@@ -1629,23 +1581,17 @@ uint State::extend(uint col, bool zero, bool one) {
             side[rows + col] = 0;
             rc = extend(col1, ok[0], ok[1]);
         }
-        pos_to  = lower_bound(pos_to, min(pos_to + col1, set_to.cend()-1), current2,
-                                [](Column const&left, Column const& right) { return cmp(left, right) < 0; });
-        pos_sum = lower_bound(pos_sum, min(pos_sum + col1, set_sum.cend()-1), current2,
-                                [](Column const&left, Column const& right) { return cmp(left, right) < 0; });
+        pos_to  = lower_bound(pos_to, min(pos_to + col1, set_to.cend()-1), current2);
+        pos_sum = lower_bound(pos_sum, min(pos_sum + col1, set_sum.cend()-1), current2);
         if (SKIP2)
-            pos_to2 = lower_bound(pos_to, min(pos_to + 2*col1+3, set_to.cend()-1), current22,
-                                    [](Column const&left, Column const& right) { return cmp(left, right) < 0; });
+            pos_to2 = lower_bound(pos_to, min(pos_to + 2*col1+3, set_to.cend()-1), current22);
     } else {
         current2 [ELEMENTS-1] += ROW_FACTOR;
-        pos_to  = lower_bound(set_to.cbegin()+1, set_to.cend()-1, current2,
-                                [](Column const&left, Column const& right) { return cmp(left, right) < 0; });
-        pos_sum = lower_bound(set_sum.cbegin()+1, set_sum.cend()-1, current2,
-                                [](Column const&left, Column const& right) { return cmp(left, right) < 0; });
+        pos_to  = lower_bound(set_to.cbegin()+1, set_to.cend()-1, current2);
+        pos_sum = lower_bound(set_sum.cbegin()+1, set_sum.cend()-1, current2);
         if (SKIP2) {
             current22[ELEMENTS-1] += ROW_FACTOR * 2;
-            pos_to2 = lower_bound(set_to.cbegin()+1, set_to.cend()-1, current22,
-                                    [](Column const&left, Column const& right) { return cmp(left, right) < 0; });
+            pos_to2 = lower_bound(set_to.cbegin()+1, set_to.cend()-1, current22);
         }
     }
 
@@ -1802,6 +1748,8 @@ Connection::Connection(string const& host, string const& service, uint nr_thread
         io_in_ .set<Connection, &Connection::readable>(this);
         timer_greeting_.set<Connection, &Connection::timeout_greeting>(this);
         timer_greeting_.start(TIMEOUT_GREETING);
+        timer_output_.set<TimeBuffer::flush>();
+        timer_output_.start(0, 1);
         sig_usr1_.set<Connection, &Connection::threads_less>(this);
         sig_usr1_.start(SIGUSR1);
         sig_usr2_.set<Connection, &Connection::threads_more>(this);
@@ -1816,7 +1764,7 @@ Connection::Connection(string const& host, string const& service, uint nr_thread
 }
 
 void Connection::timeout_greeting(ev::timer& timer, int revents) {
-    client_out << "Connection greeting timed out" << endl;
+    timed_out << "Connection greeting timed out" << endl;
     stop();
 }
 
@@ -1830,7 +1778,7 @@ void Connection::drop_idle() {
                     swap(states[i], states[states.size()-1]);
                 idle_.pop_back();
                 states.pop_back();
-                client_out << "Changed number of threads to " << states.size() << endl;
+                timed_out << "Changed number of threads to " << states.size() << endl;
                 goto CONTINUE;
             }
         throw(logic_error("idle state is not in state set"));
@@ -1852,7 +1800,7 @@ void Connection::got_proto(uint8_t const* ptr, size_t length) {
 void Connection::got_size(uint8_t const* ptr, size_t length) {
     rows = *ptr;
     if (rows > MAX_ROWS) throw(range_error("Rows " + to_string(rows) + " > MAX_ROWS=" + to_string(MAX_ROWS)));
-    client_out << "Client " << id << " starts working on " << rows << " rows" << endl;
+    timed_out << "Client " << id << " starts working on " << rows << " rows" << endl;
     timer_greeting_.stop();
 
     nr_rows = static_cast<Index>(1) << rows;
@@ -1878,14 +1826,11 @@ void Connection::got_info(uint8_t const* ptr, size_t length) {
         lock_guard<mutex> lock{mutex_info};
         if (ptr[0] > info.min) {
             info.min = ptr[0];
-            if (ptr[0] > max_cols_) {
-                throw(logic_error("Solution should always precede info"));
-                max_cols_ = ptr[0];
-            }
+            if (ptr[0] > max_cols_) max_cols_ = ptr[0];
         }
         if (ptr[1] < info.max) info.max = ptr[1];
     }
-    // client_out << "Got info " << index << " [" << static_cast<uint>(info.min) << ", " << static_cast<uint>(info.max) << "]\n";
+    // timed_out << "Got info " << index << " [" << static_cast<uint>(info.min) << ", " << static_cast<uint>(info.max) << "]\n";
 }
 
 void Connection::got_fork(uint8_t const* ptr, size_t length) {
@@ -1932,14 +1877,14 @@ void Connection::got_solution(uint8_t const* ptr, size_t length) {
             bits >>= 1;
         }
     }
-    client_out << "Some computer found: rows=" << rows << ",cols=" << cols << "\n";
+    timed_out << "Some computer found: rows=" << rows << ",cols=" << cols << "\n";
     for (uint r=0; r<rows; ++r) {
         auto m = &matrix[rows-1-r];
         for (uint c=0; c<cols; ++c)
-            client_out << static_cast<uint>(*m++) << " ";
-        client_out << "\n";
+            timed_out << static_cast<uint>(*m++) << " ";
+        timed_out << "\n";
     }
-    client_out << "----------" << endl;
+    timed_out << "----------" << endl;
 }
 
 void Connection::got_idle(uint8_t const* ptr, size_t length) {
@@ -1948,9 +1893,9 @@ void Connection::got_idle(uint8_t const* ptr, size_t length) {
 
     if (idle_.size() == 0)
         throw(logic_error("Idle while working"));
-    client_out << "Idle";
-    for (State* state: idle_) client_out << " " << state->id();
-    client_out << endl;
+    timed_out << "Idle";
+    for (State* state: idle_) timed_out << " " << state->id();
+    timed_out << endl;
 }
 
 void Connection::got_finished(uint8_t const* ptr, size_t length) {
@@ -1960,7 +1905,7 @@ void Connection::got_finished(uint8_t const* ptr, size_t length) {
     if (idle_.size() != nr_threads_)
         throw(logic_error("Finished while working"));
     stop();
-    client_out << "Finished" << endl;
+    timed_out << "Finished" << endl;
 }
 
 void Connection::got_threads (uint8_t const* ptr, size_t length) {
@@ -1972,7 +1917,7 @@ void Connection::got_threads (uint8_t const* ptr, size_t length) {
     nr_threads_ = *ptr;
     while (states.size() < nr_threads_) {
         new_state()->fork();
-        client_out << "Changed number of threads to " << states.size() << endl;
+        timed_out << "Changed number of threads to " << states.size() << endl;
     }
     drop_idle();
 }
@@ -2029,10 +1974,10 @@ void Connection::readable(ev::io& watcher, int revents) {
     if (rc < 0) {
         if (errno == EWOULDBLOCK || errno == EAGAIN || errno == EINTR) return;
         auto err = strerror(errno);
-        client_out << "Could not read: " << err << endl;
+        timed_out << "Could not read: " << err << endl;
     } else {
         // Close
-        client_out << "Peer closed connection" << endl;
+        timed_out << "Peer closed connection" << endl;
     }
     stop();
 }
@@ -2057,21 +2002,21 @@ void Connection::writable(ev::io& watcher, int revents) {
 void Connection::threads_more(ev::sig& watcher, int revents) {
     if (wanted_threads_ < 255) {
         ++wanted_threads_;
-        client_out << "Increase wanted number of threads to " << wanted_threads_;
+        timed_out << "Increase wanted number of threads to " << wanted_threads_;
         if (forked_) put1(NR_THREADS, wanted_threads_);
     } else
-        client_out << "Wanted number of threads already at maximum 255";
-    client_out << endl;
+        timed_out << "Wanted number of threads already at maximum 255";
+    timed_out << endl;
 }
 
 void Connection::threads_less(ev::sig& watcher, int revents) {
     if (wanted_threads_ > 0) {
         --wanted_threads_;
-        client_out << "Decrease wanted number of threads to " << wanted_threads_;
+        timed_out << "Decrease wanted number of threads to " << wanted_threads_;
         if (forked_) put1(NR_THREADS, wanted_threads_);
     } else
-        client_out << "Wanted number of threads already at minimum 0";
-    client_out << endl;
+        timed_out << "Wanted number of threads already at minimum 0";
+    timed_out << endl;
 }
 
 void Connection::instruments_show() const {
@@ -2079,8 +2024,8 @@ void Connection::instruments_show() const {
 
     Instruments instruments;
     for (auto& state: states) instruments += state->instruments();
-    client_out << "\n" << instruments;
-    client_out.flush();
+    timed_out << "\n" << instruments;
+    timed_out.flush();
 }
 
 void Connection::state_show(ev::sig& watcher, int revents) {
@@ -2102,7 +2047,6 @@ void Connection::put(uint type, void const* data, size_t size) {
 void Connection::put_known(Index col) {
     if (out_.size() == 0) io_out_.start(fd(), ev::WRITE);
     auto& info = col_info[col];
-    // client_out << "put_known(" << col << ", " << static_cast<uint>(info.min) << ", " << static_cast<uint>(info.max) << ")" << endl;
     out_.push_back(8);
     out_.push_back(INFO);
     for (int i=0; i<4; ++i) {
@@ -2236,7 +2180,7 @@ void Listener::connection(ev::io& watcher, int revents) {
     auto& connection = *result.first->second;
     connection.peer(peer);
     connection.put1(PROTO, PROTO_VERSION);
-    server_out << "Accept " << fd << " from " << peer << endl;
+    timed_out << "Accept " << fd << " from " << peer << endl;
 }
 
 void input(string const& name) {
@@ -2284,7 +2228,7 @@ void input(string const& name) {
             if (info.min > info.max)
                 throw(runtime_error("File " + name + ": Update sets Min > Max: " + line));
         }
-        // server_out << "index " << index << ", min " << min_cols << ",max " << max_cols << ", version " << version << endl;
+        // timed_out << "index " << index << ", min " << min_cols << ",max " << max_cols << ", version " << version << endl;
     }
     throw(runtime_error("File " + name + " does not end on " + TERMINATOR));
 }
@@ -2351,7 +2295,7 @@ void server(int argc, char** argv) {
     create_work();
 
     if (col_work.size() == 0) {
-        server_out << "Nothing to be done" << endl;
+        timed_out << "Nothing to be done" << endl;
     } else {
         auto rc = signal(SIGPIPE, SIG_IGN);
         if (rc == SIG_ERR)
@@ -2359,7 +2303,7 @@ void server(int argc, char** argv) {
 
         Listener listener{port};
 
-        server_out << "Trying " << rows << " rows" << endl;
+        timed_out << "Trying " << rows << " rows" << endl;
 
         listener.start();
         loop.run(0);
@@ -2399,7 +2343,7 @@ void client(int argc, char** argv) {
     connection.start();
     loop.run(0);
 
-    server_out << "Processing finished" << endl;
+    timed_out << "Processing finished" << endl;
     return;
 }
 
@@ -2421,7 +2365,7 @@ int main(int argc, char** argv) {
         if (is_server) server(argc, argv);
         else           client(argc, argv);
     } catch(exception& e) {
-        server_out << "Error: " << e.what() << endl;
+        timed_out << "Error: " << e.what() << endl;
         exit(EXIT_FAILURE);
     }
     exit(EXIT_SUCCESS);

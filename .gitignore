@@ -1,0 +1,7 @@
+*~
+*.o
+propertyX
+propertyXCheck
+propertyXLatticeCheck
+propertyX.*.txt
+!*/propertyX.*.txt
