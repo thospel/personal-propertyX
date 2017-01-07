@@ -56,13 +56,10 @@ class Listener {
     void connection(ev::io& watcher, int revents);
     void start() {
         watch_.start(fd(), ev::READ);
-        timer_output_.set<TimeBuffer::flush>();
-        timer_output_.start(0, 1);
     }
     void stop()  {
         if (fd_ < 0) return;
         watch_.stop();
-        timer_output_.stop();
         close(fd_);
         fd_ = -1;
     }
@@ -75,7 +72,6 @@ class Listener {
     }
   private:
     ev::io watch_;
-    ev::timer timer_output_;
     chrono::steady_clock::time_point start_;
     int fd_;
 };

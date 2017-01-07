@@ -2,6 +2,8 @@
 # define PROPERTYX_HPP
 # pragma once
 
+#include "log_buffer.hpp"
+
 #include <climits>
 #include <cstdint>
 #include <ctgmath>
@@ -80,24 +82,7 @@ enum {
     GET_PROGRAM = 4*256,
 };
 
-class TimeBuffer: public std::stringbuf {
-  public:
-    ~TimeBuffer() {
-        sync();
-        flush();
-    };
-    int sync();
-    static std::stringstream full_out;
-    static void flush();
-    static void flush(ev::timer &w, int revents) { flush(); }
-};
-
-class TimeStream: public std::ostream {
-  public:
-    TimeStream(): std::ostream{&buffer} {}
-  private:
-    TimeBuffer buffer;
-};
+extern LogStream  log_out;
 extern TimeStream timed_out;
 
 extern ev::default_loop loop;
@@ -105,10 +90,8 @@ extern ev::default_loop loop;
 extern Index nr_rows, top_row;
 extern uint rows;
 extern uint max_cols_;
-extern std::mutex mutex_out;
 
 extern void client(int argc, char** argv);
 extern void server(int argc, char** argv);
-extern std::string time_string();
 
 #endif // PROPERTYX_HPP

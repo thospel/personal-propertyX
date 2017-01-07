@@ -3,7 +3,6 @@
 #include <cstring>
 #include <ctime>
 
-#include <iostream>
 #include <stdexcept>
 
 using namespace std;
@@ -79,17 +78,14 @@ int LogBuffer::sync() {
     return _sync();
 }
 
-TimedBuffer::TimedBuffer(LogSink& log_sink, std::string const& format) :
+TimeBuffer::TimeBuffer(LogSink& log_sink, std::string const& format) :
     LogBuffer(log_sink)
 {
-    format_.resize(format.size()+2);
-    format_[0] = ' ';
-    memcpy(&format_[1], &format[0], format.size());
-    format_[format.size()+1] = 0;
-    out_.resize(format.size() + 1);
+    format_ = format + '\0';
+    out_.resize(format.size());
 }
 
-std::string TimedBuffer::time_string() {
+std::string TimeBuffer::time_string() {
     time_t t = time(nullptr);
     if (t == static_cast<time_t>(-1))
         throw(system_error(errno, system_category(), "Could not get time"));
@@ -97,13 +93,14 @@ std::string TimedBuffer::time_string() {
     if (localtime_r(&t, &tm) == nullptr)
         throw(runtime_error("Could not get localtime"));
     while (true) {
-        size_t size = strftime(&out_[0], out_.size(), &format_[0], &tm);
-        if (size) return string{&out_[1], size-1};
+        size_t size = strftime(&out_[0], out_.size(), format_.data(), &tm);
+        // Does not handle %l returning an empty string
+        if (size || format_[0] == 0) return string{&out_[0], size};
         out_.resize(2*out_.size());
     }
 }
 
-int TimedBuffer::sync() {
+int TimeBuffer::sync() {
     prefix(time_string());
     return _sync();
 }

@@ -93,32 +93,6 @@ class State {
     void show() { show_ = 1; }
     Instruments const& instruments() const { return instruments_; }
   private:
-
-    class IdBuffer: public stringbuf {
-      public:
-        IdBuffer(uint const& id): id_{id} {}
-        ~IdBuffer() { sync(); };
-        int sync() {
-            if (!str().empty()) {
-                {
-                    lock_guard<mutex> lock{mutex_out};
-                    TimeBuffer::full_out << time_string() << "Worker " << id_ << ": " << str();
-                }
-                str("");
-            }
-            return 0;
-        }
-      private:
-        uint const& id_;
-    };
-
-    class IdStream: public ostream {
-      public:
-        IdStream(uint const& id): ostream{&buffer}, buffer{id} {}
-      private:
-        IdBuffer buffer;
-    };
-
     void stop() COLD { io_in_.stop(); }
     void pipe_write(void const* ptr, size_t size);
     void readable(ev::io& watcher, int revents);
@@ -130,7 +104,7 @@ class State {
 
     Column current_;
     vector<Set> sets;
-    IdStream id_out;
+    TimeStream id_out;
     string pipe_in_;
     Connection* const connection_;
     ev::io io_in_;
@@ -225,7 +199,6 @@ class Connection {
         io_in_.stop();
         io_out_.stop();
         timer_greeting_.stop();
-        timer_output_.stop();
         sig_usr1_.stop();
         sig_usr2_.stop();
         sig_sys_.stop();
@@ -267,7 +240,6 @@ class Connection {
     ev::io io_in_;
     ev::io io_out_;
     ev::timer timer_greeting_;
-    ev::timer timer_output_;
     ev::sig sig_usr1_, sig_usr2_, sig_sys_;
     string in_;
     string out_;
@@ -293,7 +265,7 @@ ostream& operator<<(ostream& os, Column const& column) {
 }
 
 State::State(Connection* connection):
-    id_out{id_},
+    id_out{timed_out.log_sink(), timed_out.format() + "Worker " + to_string(next_id) + ": "},
     connection_{connection},
     finished_{0},
     show_{0}
@@ -491,7 +463,7 @@ NOINLINE Set::const_iterator lower_bound(Set::const_iterator begin,
 }
 
 void indent(uint row) {
-    for (uint i=0; i<row; ++i) cout << "  ";
+    for (uint i=0; i<row; ++i) log_out << "  ";
 }
 
 void State::skip_message(uint col, bool front) {
@@ -562,9 +534,8 @@ uint State::extend(uint col, bool zero, bool one) {
     }
 
     if (DEBUG_SET) {
-        lock_guard<mutex> lock(mutex_out);
         indent(col);
-        cout << "current_=" <<   current_ << ", zero=" << (zero ? 1 : 0) << ", one=" << (one ? 1 : 0) << "\n";
+        log_out << "current_=" <<   current_ << ", zero=" << (zero ? 1 : 0) << ", one=" << (one ? 1 : 0) << endl;
     }
 
     if (SKIP_BACK) {
@@ -647,9 +618,8 @@ uint State::extend(uint col, bool zero, bool one) {
         (pos_from_low2 - pos_current.first) +
         (pos_current.first - set_from.cbegin() - 1) * 2;
     if (false) {
-        lock_guard<mutex> lock(mutex_out);
         indent(col);
-        cout << "low=" << pos_current.first - set_from.cbegin() - 1 <<
+        log_out << "low=" << pos_current.first - set_from.cbegin() - 1 <<
             ", low2=" << pos_from_low2  - set_from.cbegin() - 1 <<
             ", skip_begin=" << skip_begin << endl;
     }
@@ -658,18 +628,17 @@ uint State::extend(uint col, bool zero, bool one) {
     Element* RESTRICT ptr_end = ptr_to + skip_begin * ELEMENTS;
     while (ptr_to < ptr_end) {
         if (false) {
-            lock_guard<mutex> lock(mutex_out);
             indent(col);
-            cout << "col_low1" << col_low1 << "\n";
+            log_out << "col_low1" << col_low1 << "\n";
             indent(col);
-            cout << "col_low2" << col_low2 << "\n";
+            log_out << "col_low2" << col_low2 << endl;
         }
 
         c = cmp(col_low1, col_low2);
         if (c == -1) {
             c = cmp(col_low1, ptr_middle);
             if (c == -1) {
-                // cout << "LOW1\n";
+                // log_out << "LOW1" << endl;
                 ptr_low1 -= ELEMENTS;
                 for (uint j=0; j<ELEMENTS; ++j) {
                     *ptr_to++   = col_low1[j];
@@ -679,13 +648,13 @@ uint State::extend(uint col, bool zero, bool one) {
             }
             if (c ==  1) goto MIDDLE_L;
             // low1 == middle
-            // cout << "low1 == middle\n";
+            // log_out << "low1 == middle" << endl;
             return col;
         }
         if (c ==  1) {
             c = cmp(col_low2, ptr_middle);
             if (c == -1) {
-                // cout << "LOW2\n";
+                // log_out << "LOW2" << endl;
                 for (uint j=0; j<ELEMENTS; ++j) {
                     *ptr_to++   = col_low2[j];
                     col_low2[j] = *ptr_low2++ - current[j];
@@ -694,11 +663,11 @@ uint State::extend(uint col, bool zero, bool one) {
             }
             if (c ==  1) goto MIDDLE_L;
             // low2 == middle
-            // cout << "low2 == middle\n";
+            // log_out << "low2 == middle" << endl;
             return col;
         }
         // low1 == low2
-        // cout << "low1 == low2\n";
+        // log_out << "low1 == low2" << endl;
         return col;
 
       SUM_L:
@@ -713,7 +682,7 @@ uint State::extend(uint col, bool zero, bool one) {
         return col;
 
       MIDDLE_L:
-        // cout << "MIDDLE_L\n";
+        // log_out << "MIDDLE_L" << endl;
         for (uint j=0; j<ELEMENTS; ++j)
             *ptr_to++ = *ptr_middle++;
         // {middle} can never be in {sum} or we would already have found
@@ -746,31 +715,28 @@ uint State::extend(uint col, bool zero, bool one) {
     }
     auto skip_end = set_from.cend() - 1 - pos_from_high;
     if (false) {
-        lock_guard<mutex> lock(mutex_out);
         indent(col);
-        cout << "end=" << pos_from_high - set_from.cbegin() - 1 <<
+        log_out << "end=" << pos_from_high - set_from.cbegin() - 1 <<
             ", skip_end=" << skip_end << endl;
     }
     ptr_end = &set_to[set_to.size()-1][0] - skip_end * ELEMENTS;
     if (false) {
-        lock_guard<mutex> lock(mutex_out);
         indent(col);
-        cout << "middle=" << (ptr_end-ptr_to)/ELEMENTS << endl;
+        log_out << "middle=" << (ptr_end-ptr_to)/ELEMENTS << endl;
     }
     while (ptr_to < ptr_end) {
         if (false) {
-            lock_guard<mutex> lock(mutex_out);
             indent(col);
-            cout << "col_low2" << col_low2 << "\n";
+            log_out << "col_low2" << col_low2 << "\n";
             indent(col);
-            cout << "col_high" << col_high << "\n";
+            log_out << "col_high" << col_high << endl;
         }
 
         c = cmp(col_low2, ptr_middle);
         if (c == -1) {
             c = cmp(col_low2, col_high);
             if (c == -1) {
-                // cout << "LOW2\n";
+                // log_out << "LOW2" << endl;
                 for (uint j=0; j<ELEMENTS; ++j) {
                     *ptr_to++   = col_low2[j];
                     col_low2[j] = *ptr_low2++ - current[j];
@@ -779,19 +745,19 @@ uint State::extend(uint col, bool zero, bool one) {
             }
             if (c == 1) goto HIGH;
             // low2 == high
-            // cout << "low2 == high\n";
+            // log_out << "low2 == high" << endl;
             return col;
         }
         if (c ==  1) goto MIDDLE;
         // low2 == middle
-        // cout << "low2 == middle\n";
+        // log_out << "low2 == middle" << endl;
         return col;
 
       MIDDLE:
-        // cout << "MIDDLE\n";
+        // log_out << "MIDDLE" << endl;
         c = cmp(ptr_middle, col_high);
         if (c == -1) {
-            // cout << "MIDDLE0\n";
+            // log_out << "MIDDLE0" << endl;
             for (uint j=0; j<ELEMENTS; ++j)
                 *ptr_to++ = *ptr_middle++;
             // {middle} can never be in {sum} or we would already have found
@@ -800,11 +766,11 @@ uint State::extend(uint col, bool zero, bool one) {
         }
         if (c ==  1) goto HIGH;
         // middle == high
-        // cout << "middle == high\n";
+        // log_out << "middle == high" << endl;
         return col;
 
       HIGH:
-        // cout << "HIGH0\n";
+        // log_out << "HIGH0" << endl;
         for (uint j=0; j<ELEMENTS; ++j) {
             *ptr_to++ = col_high[j];
             col_high[j] = *ptr_high++ + current[j];
@@ -847,22 +813,22 @@ uint State::extend(uint col, bool zero, bool one) {
     if (INSTRUMENT) ++instrument.success;
 
     if (DEBUG_SET) {
-        lock_guard<mutex> lock{mutex_out};
         for (auto const& to: set_to) {
             indent(col);
-            cout << to << "\n";
+            log_out << to << "\n";
         }
+        log_out. flush();
     }
 
     auto col1 = col+1;
     if (false) {
-        lock_guard<mutex> lock{mutex_out};
         for (uint i=0; i<col1+2; ++i) {
-            cout << "Set " << i << "\n";
+            log_out << "Set " << i << "\n";
             auto& set = sets[i];
             for (auto& column: set)
-                cout << column << "\n";
+                log_out << column << "\n";
         }
+        log_out.flush();
     }
 
     if (UNLIKELY(col1 >= max_col_)) {
@@ -945,9 +911,8 @@ uint State::extend(uint col, bool zero, bool one) {
         current2[ELEMENTS-1] +=  ROW_FACTOR-1;
         if (SKIP2) current22[ELEMENTS-1] += (ROW_FACTOR-1) * 2;
         if (false) {
-            lock_guard<mutex> lock{mutex_out};
             indent(col);
-            cout << "ok0 = [" << (ok[0] ? 1 : 0) << "," << (ok[1] ? 1 : 0) << "]\n";
+            log_out << "ok0 = [" << (ok[0] ? 1 : 0) << "," << (ok[1] ? 1 : 0) << "]" << endl;
         }
 
         if (ok[0] || ok[1] || col1 >= max_col_) {
@@ -1006,9 +971,8 @@ uint State::extend(uint col, bool zero, bool one) {
         }
 
         if (false) {
-            lock_guard<mutex> lock{mutex_out};
             indent(col);
-            cout << "ok1 = [" << (ok[0] ? 1 : 0) << "," << (ok[1] ? 1 : 0) << "]\n";
+            log_out << "ok1 = [" << (ok[0] ? 1 : 0) << "," << (ok[1] ? 1 : 0) << "]" << endl;
         }
 
         if (ok[0] || ok[1] || col1 >= max_col_) {
@@ -1111,8 +1075,6 @@ Connection::Connection(string const& host, string const& service, uint nr_thread
         io_in_ .set<Connection, &Connection::readable>(this);
         timer_greeting_.set<Connection, &Connection::timeout_greeting>(this);
         timer_greeting_.start(TIMEOUT_GREETING);
-        timer_output_.set<TimeBuffer::flush>();
-        timer_output_.start(0, 1);
         sig_usr1_.set<Connection, &Connection::threads_less>(this);
         sig_usr1_.start(SIGUSR1);
         sig_usr2_.set<Connection, &Connection::threads_more>(this);
