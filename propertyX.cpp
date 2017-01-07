@@ -16,7 +16,7 @@
     SYS:  show top row of bits (without the fixed first one). This gives an
           indication of how far each thread has progressed on its current column
 */
-// nas  10 77s
+// nas  10 78s
 // asus 10 247s
 
 #include <algorithm>
@@ -57,6 +57,8 @@
 #include <arpa/inet.h>
 
 #include <ev++.h>
+
+#include "fd_buffer.hpp"
 
 using namespace std;
 
@@ -164,7 +166,8 @@ uint top_offset_;
 uint max_cols_ = 1;
 
 // Server variables
-ofstream out;
+FdBuffer out_buffer(true);
+ostream out{&out_buffer};
 Index nr_work;
 Index done_work;
 uint period = 0;
@@ -2286,11 +2289,12 @@ void server(int argc, char** argv) {
     stringstream file_in, file_out;
     file_in  << PROGRAM_NAME << "." << rows << ".txt";
     file_out << PROGRAM_NAME << "." << rows << ".out.txt";
-    out.open(file_out.str());
-    if (!out.is_open())
-        throw(system_error(errno, system_category(), "Could not create " + file_out.str()));
-    out.exceptions(std::ifstream::failbit | std::ifstream::badbit);
-    input(file_in.str());
+    auto const& name_in  = file_in .str();
+    auto const& name_out = file_out.str();
+
+    out_buffer.open(name_out);
+    input(name_in);
+    out_buffer.rename(name_in, true, false);
 
     create_work();
 
@@ -2309,15 +2313,9 @@ void server(int argc, char** argv) {
         loop.run(0);
     }
 
-    out << TERMINATOR << "\n";
-    out.close();
-    {
-        auto in_name  = file_in .str();
-        auto out_name = file_out.str();
-        auto rc = rename(out_name.c_str(), in_name.c_str());
-        if (rc)
-            throw(system_error(errno, system_category(), "Could not rename " + out_name + " to " + in_name));
-    }
+    out << TERMINATOR << endl;
+    out_buffer.fsync();
+    out_buffer.close();
 }
 
 void client(int argc, char** argv) {

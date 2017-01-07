@@ -7,6 +7,7 @@
 #include <sys/stat.h>
 
 size_t FdBuffer::BLOCK = 4096;
+bool const FSYNC = false;
 
 int FdBuffer::sync() {
     if (fd_ < 0)
@@ -62,6 +63,8 @@ void FdBuffer::fsync() {
     if (fd_ < 0)
         throw(logic_error("Fsync on FdBuffer without filedescriptor"));
 
+    if (!FSYNC) return;
+
     auto rc = ::fsync(fd_);
     if (rc < 0)
         throw(system_error(errno, system_category(), "fsync error on " + name_));
@@ -71,7 +74,7 @@ void FdBuffer::rename(string const& new_name, bool do_fsync, int tmp_file) {
     if (fd_ < 0)
         throw(logic_error("Rename on FdBuffer without filedescriptor"));
 
-    if (do_fsync) fsync();
+    if (FSYNC && do_fsync) fsync();
 
     if (::rename(name_.c_str(), new_name.c_str()) != 0)
         throw(system_error(errno, system_category(), "Could not rename " + name_ + " to " + new_name));
@@ -79,7 +82,7 @@ void FdBuffer::rename(string const& new_name, bool do_fsync, int tmp_file) {
 
     if (tmp_file >= 0) tmp_file_ = tmp_file > 0;
 
-    if (do_fsync) {
+    if (FSYNC && do_fsync) {
         auto pos = name_.rfind('/');
 
         string const dir = pos == string::npos ?
