@@ -168,7 +168,7 @@ uint max_cols_ = 1;
 
 // Server variables
 FdBuffer out_buffer(true);
-ostream out{&out_buffer};
+ostream info_out{&out_buffer};
 Index nr_work;
 Index done_work;
 uint period = 0;
@@ -227,7 +227,8 @@ class TimeBuffer: public stringbuf {
     ~TimeBuffer() {
         sync();
         flush();
-    };
+    }
+  protected:
     int sync() {
         if (!str().empty()) {
             {
@@ -238,6 +239,7 @@ class TimeBuffer: public stringbuf {
         }
         return 0;
     }
+  public:
     static stringstream full_out;
     static void flush() {
         if (full_out.str().empty()) return;
@@ -246,7 +248,6 @@ class TimeBuffer: public stringbuf {
         cout.flush();
         full_out.str("");
     }
-    static void flush(ev::timer &w, int revents) { flush(); }
 };
 stringstream TimeBuffer::full_out;
 
@@ -387,9 +388,13 @@ class Listener {
     ~Listener() { stop(); }
     int fd() const { return fd_; }
     void connection(ev::io& watcher, int revents);
+    void io_flush(ev::timer& w, int revents) {
+        out_buffer.sync();
+        TimeBuffer::flush();
+    }
     void start() {
         watch_.start(fd(), ev::READ);
-        timer_output_.set<TimeBuffer::flush>();
+        timer_output_.set<Listener, &Listener::io_flush>(this);
         timer_output_.start(0, 1);
     }
     void stop()  {
@@ -491,12 +496,12 @@ bool Accept::update_info(ResultInfo& info, Index col, uint8_t min, uint8_t max) 
     if (info.version == 0)
         col_known.emplace_back(col);
     else if (info.version != program_version_) {
-        out << col << " " << info << "\n";
+        info_out << col << " " << info << "\n";
     }
     info.version = program_version_;
     if (min > info.min) info.min = min;
     if (max < info.max) info.max = max;
-    out << col << " " << info << endl;
+    info_out << col << " " << info << "\n";
     return true;
 }
 
@@ -505,11 +510,11 @@ bool Accept::update_info(ResultInfo& info, Index col, uint8_t min) {
     if (info.version == 0)
         col_known.emplace_back(col);
     else if (info.version != program_version_) {
-        out << col << " " << info << "\n";
+        info_out << col << " " << info << "\n";
     }
     info.version = program_version_;
     if (min > info.min) info.min = min;
-    out << col << " " << info << endl;
+    info_out << col << " " << info << "\n";
     return true;
 }
 
@@ -842,6 +847,9 @@ class Connection {
     void start() {
         io_in_ .start(fd_, ev::READ);
         put1(PROTO, PROTO_VERSION);
+    }
+    void io_flush(ev::timer& w, int revents) {
+        TimeBuffer::flush();
     }
     int fd() const { return fd_; }
     // put*: Send info to server
@@ -1758,7 +1766,7 @@ Connection::Connection(string const& host, string const& service, uint nr_thread
         io_in_ .set<Connection, &Connection::readable>(this);
         timer_greeting_.set<Connection, &Connection::timeout_greeting>(this);
         timer_greeting_.start(TIMEOUT_GREETING);
-        timer_output_.set<TimeBuffer::flush>();
+        timer_output_.set<Connection, &Connection::io_flush>(this);
         timer_output_.start(0, 1);
         sig_usr1_.set<Connection, &Connection::threads_less>(this);
         sig_usr1_.start(SIGUSR1);
@@ -2202,8 +2210,7 @@ void input(string const& name) {
         if (line == TERMINATOR) {
             sort(col_known.begin(), col_known.end());
             for (Index i: col_known)
-                out << i << " " << result_info[i] << "\n";
-            out.flush();
+                info_out << i << " " << result_info[i] << "\n";
             return;
         }
         istringstream iss{line};
@@ -2230,7 +2237,7 @@ void input(string const& name) {
             col_known.emplace_back(index);
         } else {
             if (info.version != new_info.version) {
-                out << index << " " << info << "\n";
+                info_out << index << " " << info << "\n";
                 info.version = new_info.version;
             }
             if (new_info.min > info.min) info.min = new_info.min;
@@ -2301,6 +2308,7 @@ void server(int argc, char** argv) {
 
     out_buffer.open(name_out);
     input(name_in);
+    info_out.flush();
     out_buffer.rename(name_in, true, false);
 
     create_work();
@@ -2320,7 +2328,7 @@ void server(int argc, char** argv) {
         loop.run(0);
     }
 
-    out << TERMINATOR << endl;
+    info_out << TERMINATOR << endl;
     out_buffer.fsync();
     out_buffer.close();
 }
