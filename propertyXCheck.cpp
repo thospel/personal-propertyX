@@ -101,7 +101,8 @@ Element const ELEMENT_TOP = POWN(ROW_FACTOR, ROWS_PER_ELEMENT -1);
 Element const ELEMENT_MAX = numeric_limits<Element>::max();
 int const COLUMN_WIDTH = ceil(log10(static_cast<double>(ROW_FACTOR)));
 
-inline int cmp(auto const& left, auto const& right) {
+template <typename T1, typename T2>
+inline int cmp(T1 const& left, T2 const& right) {
     for (uint i=0; i<ELEMENTS; ++i) {
         if (left[i] < right[i]) return -1;
         if (left[i] > right[i]) return  1;

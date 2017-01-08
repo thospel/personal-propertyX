@@ -1,6 +1,6 @@
 CXXFLAGS  = -Wall -O3 -march=native -fstrict-aliasing -std=c++14 -g -pthread
 LDFLAGS = -g
-CXX = ccache g++
+CXX := ccache $(CXX)
 
 all: propertyX propertyXCheck propertyXLatticeCheck
 

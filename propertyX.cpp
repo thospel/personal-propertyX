@@ -140,7 +140,11 @@ using MilliSec = chrono::milliseconds;
 uint const MAX_COLS = 54;
 uint const ROW_FACTOR = (MAX_COLS+1) | 1;		// 55
 uint const ROW_ZERO   = ROW_FACTOR/2;			// 27
+#ifdef __clang__ 
+uint const ROWS_PER_ELEMENT = 11;
+#else // __clang__ 
 uint const ROWS_PER_ELEMENT = CHAR_BIT*sizeof(Element) / log2(ROW_FACTOR); // 11
+#endif // __clang__ 
 uint const MAX_ROWS = ROWS_PER_ELEMENT * ELEMENTS;	// 22
 Element constexpr ELEMENT_FILL(Element v = ROW_ZERO, int n = ROWS_PER_ELEMENT) {
     return n ? ELEMENT_FILL(v, n-1) * ROW_FACTOR + v : 0;
@@ -342,7 +346,8 @@ vector<ColInfo> col_info;
 
 struct ResultInfo {
     static uint8_t const MAX = numeric_limits<uint8_t>::max();
-    ResultInfo(auto mi, auto ma, auto v):
+    template <typename T1, typename T2, typename T3>
+    ResultInfo(T1 mi, T2 ma, T3 v):
         min    {static_cast<uint8_t>(mi)},
         max    {static_cast<uint8_t>(ma)},
         version{static_cast<uint8_t>(v)} {}
@@ -360,7 +365,8 @@ vector<ResultInfo> result_info;
 vector<Index>   col_known;
 deque<Index>    col_work;
 
-inline int cmp(auto const& left, auto const& right) {
+template <typename T1, typename T2>
+inline int cmp(T1 const& left, T2 const& right) {
     for (uint i=0; i<ELEMENTS; ++i) {
         if (left[i] < right[i]) return -1;
         if (left[i] > right[i]) return  1;
