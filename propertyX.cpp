@@ -135,6 +135,7 @@ using Column   = array<Element, ELEMENTS>;
 using Set      = vector<Column>;
 using Sum      = uint8_t;
 using Sec      = chrono::seconds;
+using MilliSec = chrono::milliseconds;
 
 uint const MAX_COLS = 54;
 uint const ROW_FACTOR = (MAX_COLS+1) | 1;		// 55
@@ -405,6 +406,10 @@ class Listener {
         auto now = chrono::steady_clock::now();
         return chrono::duration_cast<Sec>(now-start_).count();
     }
+    double delapsed() const {
+        auto now = chrono::steady_clock::now();
+        return chrono::duration_cast<MilliSec>(now-start_).count() / 1000.;
+    }
   private:
     ev::io watch_;
     ev::timer timer_output_;
@@ -440,6 +445,7 @@ class Accept {
     void put_work();
     void peer(string const& peer) { peer_id_ = peer; }
     int64_t elapsed() const { return listener_->elapsed(); }
+    double delapsed() const { return listener_->delapsed(); }
   private:
     void readable(ev::io& watcher, int revents);
     void writable(ev::io& watcher, int revents);
@@ -581,11 +587,12 @@ void Accept::got_result(uint8_t const* ptr, size_t length) {
     // if (done_work >= nr_work) loop.unloop();
     if (done_work >= nr_work) {
         listener_->stop();
+        auto elapsed_ = delapsed();
         for (auto& element: accepted) {
             auto& connection = *element.second;
             connection.put(FINISHED);
         }
-        timed_out << "Finished" << endl;
+        timed_out << "Finished (" << elapsed_ << " s)" << endl;
     }
 }
 
