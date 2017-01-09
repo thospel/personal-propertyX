@@ -352,6 +352,7 @@ struct ResultInfo {
         max    {static_cast<uint8_t>(ma)},
         version{static_cast<uint8_t>(v)} {}
     ResultInfo(): ResultInfo(0, MAX, 0) {}
+    bool is_done() const { return max != MAX; }
 
     uint8_t min, max, version;
 };
@@ -2235,7 +2236,7 @@ void input(string const& name) {
             throw(runtime_error("File " + name + ": Min > Max: " + line));
 
         ResultInfo new_info{min_cols,max_cols,version};
-        if (new_info.max > max_cols_ && new_info.max != ResultInfo::MAX)
+        if (new_info.max > max_cols_ && new_info.is_done())
             max_cols_ = new_info.max;
         auto& info = result_info[index];
         if (info.version == 0) {
@@ -2267,7 +2268,7 @@ void create_work() {
         Index col = 0;
         for (uint c=0; c<count1; ++c)
             col |= top_row >> col1[c];
-        if (result_info[col].version == 0)
+        if (!result_info[col].is_done())
             col_work.emplace_back(col);
 
         uint c = count1;
