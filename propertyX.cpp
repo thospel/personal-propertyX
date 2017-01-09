@@ -2376,7 +2376,7 @@ int main(int argc, char** argv) {
             while (isspace(*ptr)) ++ptr;
             if (*ptr == 0) {
                 if (i < 2) throw(range_error("Rows must be >= 2"));
-                if (i > MAX_ROWS)
+                if (static_cast<unsigned long>(i) > MAX_ROWS)
                     throw(range_error("Rows must be <= " + to_string(MAX_ROWS)));
                 rows = i;
                 is_server = true;
