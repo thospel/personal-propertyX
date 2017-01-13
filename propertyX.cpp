@@ -37,6 +37,7 @@
 #include <string>
 #include <thread>
 #include <type_traits>
+#include <utility>
 #include <vector>
 
 #include <cctype>
@@ -171,6 +172,9 @@ uint top_offset_;
 uint max_cols_ = 1;
 
 // Server variables
+std::chrono::duration<double> total_duration = chrono::steady_clock::duration::zero();
+double total_results = 0;
+
 FdBuffer out_buffer(true);
 ostream info_out{&out_buffer};
 Index nr_work;
@@ -414,12 +418,10 @@ class Listener {
     void start_timer() {
         start_ = chrono::steady_clock::now();
     }
-    int64_t elapsed() const {
-        auto now = chrono::steady_clock::now();
+    int64_t elapsed(chrono::steady_clock::time_point now = chrono::steady_clock::now()) const {
         return chrono::duration_cast<Sec>(now-start_).count();
     }
-    double delapsed() const {
-        auto now = chrono::steady_clock::now();
+    double delapsed(chrono::steady_clock::time_point now = chrono::steady_clock::now()) const {
         return chrono::duration_cast<MilliSec>(now-start_).count() / 1000.;
     }
   private:
@@ -456,8 +458,8 @@ class Accept {
     void put_info(Index index, ResultInfo const& info);
     void put_work();
     void peer(string const& peer) { peer_id_ = peer; }
-    int64_t elapsed() const { return listener_->elapsed(); }
-    double delapsed() const { return listener_->delapsed(); }
+    int64_t elapsed(chrono::steady_clock::time_point now = chrono::steady_clock::now()) const { return listener_->elapsed(now); }
+    double delapsed(chrono::steady_clock::time_point now = chrono::steady_clock::now()) const { return listener_->delapsed(now); }
   private:
     void readable(ev::io& watcher, int revents);
     void writable(ev::io& watcher, int revents);
@@ -483,7 +485,7 @@ class Accept {
     inline void got_solution(uint8_t const* ptr, size_t length);
     inline void got_threads (uint8_t const* ptr, size_t length);
 
-    set<Index> work_;
+    map<Index,chrono::steady_clock::time_point> work_;
     Listener* const listener_;
     ev::io io_in_;
     ev::io io_out_;
@@ -585,21 +587,27 @@ void Accept::got_result(uint8_t const* ptr, size_t length) {
         throw(logic_error("Invalid result length " + to_string(length)));
 
     auto index = get_index(ptr);
-    if (!work_.erase(index))
+    auto pos = work_.find(index);
+    if (pos == work_.end())
         throw(logic_error("Result that was never requested: " + to_string(index)));
+    chrono::steady_clock::time_point now = chrono::steady_clock::now();
+    total_duration += now - pos->second;
+    ++total_results;
+    work_.erase(pos);
+
     put_work();
 
     ++done_work;
-    uint elapsed_ = elapsed();
+    uint elapsed_ = elapsed(now);
     if (elapsed_ >= period || done_work >= nr_work) {
-        timed_out << "col=" << done_work << "/" << nr_work << " (" << static_cast<uint64_t>(100*1000)*done_work/nr_work/1000. << "% " << elapsed_ << " s, avg=" << elapsed_ * 1000 / done_work / 1000. << ")" << endl;
+        timed_out << "col=" << done_work << "/" << nr_work << " (" << static_cast<uint64_t>(100*1000)*done_work/nr_work/1000. << "% " << elapsed_ << " s, avg=" << total_duration.count() / total_results << ")" << endl;
         period = (elapsed_/PERIOD+1)*PERIOD;
     }
 
     // if (done_work >= nr_work) loop.unloop();
     if (done_work >= nr_work) {
         listener_->stop();
-        auto elapsed_ = delapsed();
+        auto elapsed_ = delapsed(now);
         for (auto& element: accepted) {
             auto& connection = *element.second;
             connection.put(FINISHED);
@@ -762,8 +770,8 @@ Accept::~Accept() {
     if (out_.size()) io_out_.stop();
     close(fd_);
     accepted_idle.erase(fd_);
-    for (Index work: work_)
-        col_work.emplace_front(work);
+    for (auto& work: work_)
+        col_work.emplace_front(work.first);
     while (accepted_idle.size() && col_work.size()) {
         int fd = *accepted_idle.begin();
         Accept& accept = *accepted[fd];
@@ -812,7 +820,8 @@ void Accept::put_info(Index index, ResultInfo const& info) {
 void Accept::put_work() {
     while (col_work.size() && work_.size() < work_max_) {
         auto work = col_work.front();
-        auto rc = work_.emplace(work);
+        chrono::steady_clock::time_point now = chrono::steady_clock::now();
+        auto rc = work_.emplace(work, now);
         if (!rc.second) throw(logic_error("Duplicate work"));
         col_work.pop_front();
 
