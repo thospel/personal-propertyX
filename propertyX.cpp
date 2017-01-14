@@ -22,6 +22,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <deque>
 #include <iomanip>
@@ -274,9 +275,10 @@ class State {
     void fork();
     void got_work(Index col);
     uint id() const { return id_; }
-    ev_tstamp elapsed() const {
-        auto now = ev_time();
-        return now-start_;
+    double elapsed() const {
+        auto now = chrono::steady_clock::now();
+        std::chrono::duration<double> e = now-start_;
+        return e.count();
     }
     void show() { show_ = 1; }
     Instruments const& instruments() const { return instruments_; }
@@ -324,7 +326,7 @@ class State {
     thread thread_;
     condition_variable cv_col;
     mutex mutex_col;
-    ev_tstamp start_;
+    chrono::steady_clock::time_point start_;
     atomic<Index> input_row_;
     atomic<int> finished_;
     atomic<int> show_;
@@ -1099,7 +1101,7 @@ void State::worker() {
     std::unique_lock<std::mutex> lock_input(mutex_col);
 
     id_out << "ready" << endl;
-    start_ = ev_now(loop);
+    start_ = chrono::steady_clock::now();
 
     while (!finished_) {
         cv_col.wait(lock_input, [this]{return input_row_ < nr_rows;});
