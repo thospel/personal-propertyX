@@ -22,7 +22,6 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
-#include <chrono>
 #include <condition_variable>
 #include <deque>
 #include <iomanip>
@@ -135,17 +134,15 @@ using uElement = uint64_t;
 using Column   = array<Element, ELEMENTS>;
 using Set      = vector<Column>;
 using Sum      = uint8_t;
-using Sec      = chrono::seconds;
-using MilliSec = chrono::milliseconds;
 
 uint const MAX_COLS = 54;
 uint const ROW_FACTOR = (MAX_COLS+1) | 1;		// 55
 uint const ROW_ZERO   = ROW_FACTOR/2;			// 27
-#ifdef __clang__ 
+#ifdef __clang__
 uint const ROWS_PER_ELEMENT = 11;
-#else // __clang__ 
+#else // __clang__
 uint const ROWS_PER_ELEMENT = CHAR_BIT*sizeof(Element) / log2(ROW_FACTOR); // 11
-#endif // __clang__ 
+#endif // __clang__
 uint const MAX_ROWS = ROWS_PER_ELEMENT * ELEMENTS;	// 22
 Element constexpr ELEMENT_FILL(Element v = ROW_ZERO, int n = ROWS_PER_ELEMENT) {
     return n ? ELEMENT_FILL(v, n-1) * ROW_FACTOR + v : 0;
@@ -172,7 +169,7 @@ uint top_offset_;
 uint max_cols_ = 1;
 
 // Server variables
-std::chrono::duration<double> total_duration = chrono::steady_clock::duration::zero();
+ev_tstamp total_duration = 0;
 double total_results = 0;
 
 FdBuffer out_buffer(true);
@@ -277,9 +274,9 @@ class State {
     void fork();
     void got_work(Index col);
     uint id() const { return id_; }
-    int64_t elapsed() const {
-        auto now = chrono::steady_clock::now();
-        return chrono::duration_cast<Sec>(now-start_).count();
+    ev_tstamp elapsed() const {
+        auto now = ev_time();
+        return now-start_;
     }
     void show() { show_ = 1; }
     Instruments const& instruments() const { return instruments_; }
@@ -327,7 +324,7 @@ class State {
     thread thread_;
     condition_variable cv_col;
     mutex mutex_col;
-    chrono::steady_clock::time_point start_;
+    ev_tstamp start_;
     atomic<Index> input_row_;
     atomic<int> finished_;
     atomic<int> show_;
@@ -416,18 +413,15 @@ class Listener {
         fd_ = -1;
     }
     void start_timer() {
-        start_ = chrono::steady_clock::now();
+        start_ = ev_now(loop);
     }
-    int64_t elapsed(chrono::steady_clock::time_point now = chrono::steady_clock::now()) const {
-        return chrono::duration_cast<Sec>(now-start_).count();
-    }
-    double delapsed(chrono::steady_clock::time_point now = chrono::steady_clock::now()) const {
-        return chrono::duration_cast<MilliSec>(now-start_).count() / 1000.;
+    ev_tstamp elapsed(ev_tstamp now = ev_now(loop)) const {
+        return now-start_;
     }
   private:
     ev::io watch_;
     ev::timer timer_output_;
-    chrono::steady_clock::time_point start_;
+    ev_tstamp start_;
     int fd_;
 };
 
@@ -458,8 +452,7 @@ class Accept {
     void put_info(Index index, ResultInfo const& info);
     void put_work();
     void peer(string const& peer) { peer_id_ = peer; }
-    int64_t elapsed(chrono::steady_clock::time_point now = chrono::steady_clock::now()) const { return listener_->elapsed(now); }
-    double delapsed(chrono::steady_clock::time_point now = chrono::steady_clock::now()) const { return listener_->delapsed(now); }
+    ev_tstamp elapsed(ev_tstamp now = ev_now(loop)) const { return listener_->elapsed(now); }
   private:
     void readable(ev::io& watcher, int revents);
     void writable(ev::io& watcher, int revents);
@@ -485,7 +478,7 @@ class Accept {
     inline void got_solution(uint8_t const* ptr, size_t length);
     inline void got_threads (uint8_t const* ptr, size_t length);
 
-    map<Index,chrono::steady_clock::time_point> work_;
+    map<Index,ev_tstamp> work_;
     Listener* const listener_;
     ev::io io_in_;
     ev::io io_out_;
@@ -590,7 +583,7 @@ void Accept::got_result(uint8_t const* ptr, size_t length) {
     auto pos = work_.find(index);
     if (pos == work_.end())
         throw(logic_error("Result that was never requested: " + to_string(index)));
-    chrono::steady_clock::time_point now = chrono::steady_clock::now();
+    ev_tstamp now = ev_now(loop);
     total_duration += now - pos->second;
     ++total_results;
     work_.erase(pos);
@@ -598,16 +591,16 @@ void Accept::got_result(uint8_t const* ptr, size_t length) {
     put_work();
 
     ++done_work;
-    uint elapsed_ = elapsed(now);
-    if (elapsed_ >= period || done_work >= nr_work) {
-        timed_out << "col=" << done_work << "/" << nr_work << " (" << static_cast<uint64_t>(100*1000)*done_work/nr_work/1000. << "% " << elapsed_ << " s, avg=" << total_duration.count() / total_results << ")" << endl;
-        period = (elapsed_/PERIOD+1)*PERIOD;
+    auto elapsed_ = elapsed(now);
+    uint ielapsed = elapsed_;
+    if (ielapsed >= period || done_work >= nr_work) {
+        timed_out << "col=" << done_work << "/" << nr_work << " (" << 100.*done_work*100./nr_work << "% " << ielapsed << " s, avg=" << total_duration / total_results << ")" << endl;
+        period = (ielapsed/PERIOD+1)*PERIOD;
     }
 
     // if (done_work >= nr_work) loop.unloop();
     if (done_work >= nr_work) {
         listener_->stop();
-        auto elapsed_ = delapsed(now);
         for (auto& element: accepted) {
             auto& connection = *element.second;
             connection.put(FINISHED);
@@ -820,7 +813,7 @@ void Accept::put_info(Index index, ResultInfo const& info) {
 void Accept::put_work() {
     while (col_work.size() && work_.size() < work_max_) {
         auto work = col_work.front();
-        chrono::steady_clock::time_point now = chrono::steady_clock::now();
+        ev_tstamp now = ev_now(loop);
         auto rc = work_.emplace(work, now);
         if (!rc.second) throw(logic_error("Duplicate work"));
         col_work.pop_front();
@@ -970,6 +963,7 @@ State::State(Connection* connection):
     show_{0}
 {
     id_ = next_id++;
+    id_out << fixed << setprecision(3);
 
     auto rc = pipe(fd_);
     if (rc)
@@ -1105,7 +1099,7 @@ void State::worker() {
     std::unique_lock<std::mutex> lock_input(mutex_col);
 
     id_out << "ready" << endl;
-    start_ = chrono::steady_clock::now();
+    start_ = ev_now(loop);
 
     while (!finished_) {
         cv_col.wait(lock_input, [this]{return input_row_ < nr_rows;});
@@ -1128,7 +1122,7 @@ void State::worker() {
         buffer[rows] = 0;
         id_out << "Processing " << buffer << " (" << total << " s" << ", n=" << processed_;
         if (processed_)
-            id_out << ", avg=" << total * 1000 / processed_ / 1000. << " s";
+            id_out << ", avg=" << total / processed_ << " s";
         id_out << ")";
         if (false) {
             id_out << "\nrev=" << current_col_rev_ << ", current=" << current_;
@@ -1169,7 +1163,7 @@ void State::skip_message(uint col, bool front) {
     char buffer[MAX_ROWS+1];
     for (uint i=0; i<rows; ++i) buffer[i] = side[col+i] ? '1' : '0';
     buffer[rows] = 0;
-    id_out << "Skip front " << buffer << " (" << elapsed() << " s)" << endl;
+    id_out << (front ? "Skip front " : "Skip back ") << buffer << " (" << elapsed() << " s)" << endl;
     // id_out << (fron ? "Skip front " : "Skip back ");
     // for (uint i=0; i<rows; ++i) id_out << (side[col+i] ? '1' : '0');
     // id_out << " (" << elapsed() << " s)" << endl;
@@ -2377,6 +2371,7 @@ void client(int argc, char** argv) {
 }
 
 int main(int argc, char** argv) {
+    timed_out << fixed << setprecision(3);
     try {
         bool is_server = false;
         if (argc > 1) {
