@@ -18,7 +18,7 @@ using uint     = unsigned int;
 
 uint const PORT = 21453;
 
-uint8_t const PROTO_VERSION   = 2;
+uint8_t const PROTO_VERSION   = 3;
 uint8_t const PROGRAM_VERSION = 9;
 
 ev_tstamp const TIMEOUT_GREETING = 10;
@@ -49,6 +49,9 @@ enum {
     GET_ID      = 3*256,
     GET_PROGRAM = 4*256,
 };
+
+// #define STATIC static
+#define STATIC
 
 #ifdef __GNUC__
 # define RESTRICT __restrict__

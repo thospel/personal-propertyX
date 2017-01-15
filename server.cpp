@@ -17,8 +17,8 @@
 
 using namespace std;
 
-FdBuffer out_buffer(true);
-ostream info_out{&out_buffer};
+STATIC FdBuffer out_buffer(true);
+STATIC ostream info_out{&out_buffer};
 
 char const* PROGRAM_NAME = "propertyX";
 char const* TERMINATOR = "----";
@@ -41,22 +41,22 @@ ostream& operator<<(ostream& os, ResultInfo const& info) {
     return os;
 }
 
-Index nr_work;
-Index done_work;
+STATIC Index nr_work;
+STATIC Index done_work;
 
-vector<ResultInfo> result_info;
-vector<Index>   col_known;
-deque<Index>    col_work;
+STATIC vector<ResultInfo> result_info;
+STATIC vector<Index>   col_known;
+STATIC deque<Index>    col_work;
 
-array<uint8_t,   (MAX_COLS + MAX_ROWS - 1 + 7) / 8 * 8> side;
-array<uint8_t, 1+(MAX_COLS + MAX_ROWS - 1 + 7) / 8 * 8> solution;
+STATIC array<uint8_t,   (MAX_COLS + MAX_ROWS - 1 + 7) / 8 * 8> side;
+STATIC array<uint8_t, 1+(MAX_COLS + MAX_ROWS - 1 + 7) / 8 * 8> solution;
 
-ev_tstamp total_duration = 0;
-double total_results = 0;
+STATIC ev_tstamp total_duration = 0;
+STATIC double total_results = 0;
+STATIC uint period = 0;
+uint const PERIOD = 5*60;
 int const BACKLOG = 5;
 // int const PERIOD = 1;
-uint const PERIOD = 5*60;
-uint period = 0;
 
 // Server: Listen for incoming connection
 class Listener {
@@ -189,8 +189,8 @@ bool Accept::update_info(ResultInfo& info, Index col, uint8_t min) {
     return true;
 }
 
-set<int> accepted_idle;
-map<uint,Accept::Ptr> accepted;
+STATIC set<int> accepted_idle;
+STATIC map<uint,Accept::Ptr> accepted;
 
 void Accept::timeout_greeting(ev::timer& timer, int revents) {
     timed_out << "Accept " << fd() << " (" << peer_id_ << ") greeting timed out" << endl;
@@ -305,7 +305,7 @@ void Accept::got_solution(uint8_t const* ptr, size_t length) {
     Index col = 0;
     for (uint r=0; r<rows; ++r) {
         auto s = &side[rows-1-r];
-        col = col << 1 | *s;
+        col |= *s << r;
         for (uint c=0; c<cols; ++c)
             timed_out << static_cast<uint>(*s++) << " ";
         timed_out << "\n";
@@ -698,7 +698,7 @@ void create_work() {
     while (count1) {
         Index col = 0;
         for (uint c=0; c<count1; ++c)
-            col |= top_row >> col1[c];
+            col |= 1 << col1[c];
         if (!result_info[col].is_done())
             col_work.emplace_back(col);
 
