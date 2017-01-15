@@ -5,9 +5,11 @@ CXX := ccache $(CXX)
 all: propertyX propertyXCheck propertyXLatticeCheck
 
 # propertyX.o: propertyX.hpp
-propertyX.o fd_buffer.o server.o client.o: fd_buffer.hpp propertyX.hpp
+fd_buffer.o server.o: fd_buffer.hpp
+log_buffer.o propertyX.o server.o client.o: log_buffer.hpp
+propertyX.o server.o client.o: propertyX.hpp
 
-propertyX: propertyX.o server.o client.o fd_buffer.o
+propertyX: propertyX.o client.o log_buffer.o server.o fd_buffer.o
 	$(CXX) $(LDFLAGS) -pthread -lev $^ $(LOADLIBES) $(LDLIBS) -o $@
 
 propertyXCheck: propertyXCheck.o

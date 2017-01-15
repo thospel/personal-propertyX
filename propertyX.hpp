@@ -3,10 +3,6 @@
 # pragma once
 
 #include <array>
-#include <iostream>
-#include <mutex>
-#include <string>
-#include <sstream>
 #include <vector>
 
 #include <climits>
@@ -89,46 +85,6 @@ uint const ROWS_PER_ELEMENT = CHAR_BIT*sizeof(Element) / log2(ROW_FACTOR); // 11
 #endif // __clang__
 uint const MAX_ROWS = ROWS_PER_ELEMENT * ELEMENTS;	// 22
 
-extern std::string time_string();
-
-extern std::mutex mutex_out;
-
-class TimeBuffer: public std::stringbuf {
-  public:
-    ~TimeBuffer() {
-        sync();
-        flush();
-    }
-  protected:
-    int sync() {
-        if (!str().empty()) {
-            {
-                std::lock_guard<std::mutex> lock{mutex_out};
-                full_out << time_string() << str();
-            }
-            str("");
-        }
-        return 0;
-    }
-  public:
-    static std::stringstream full_out;
-    static void flush() {
-        if (full_out.str().empty()) return;
-        std::lock_guard<std::mutex> lock{mutex_out};
-        std::cout << full_out.str();
-        std::cout.flush();
-        full_out.str("");
-    }
-};
-
-class TimeStream: public std::ostream {
-  public:
-    TimeStream(): std::ostream{&buffer} {}
-  private:
-    TimeBuffer buffer;
-};
-
-extern TimeStream timed_out;
 extern ev::default_loop loop;
 
 extern uint max_cols_;

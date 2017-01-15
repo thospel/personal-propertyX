@@ -1,5 +1,6 @@
 #include "propertyX.hpp"
 #include "fd_buffer.hpp"
+#include "log_buffer.hpp"
 
 #include <algorithm>
 #include <deque>

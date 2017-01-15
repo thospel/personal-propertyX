@@ -19,6 +19,7 @@
 // nas  10 78s
 // asus 10 247s
 
+#include "log_buffer.hpp"
 #include "propertyX.hpp"
 
 #include <iomanip>
@@ -29,23 +30,7 @@ uint max_cols_ = 1;
 uint rows;
 Index nr_rows, top_row;
 
-mutex mutex_out;
-stringstream TimeBuffer::full_out;
-
-TimeStream timed_out;
 ev::default_loop loop;
-
-string time_string() {
-    time_t t = time(NULL);
-    if (t == static_cast<time_t>(-1))
-        throw(system_error(errno, system_category(), "Could not get time"));
-    struct tm tm;
-    if (localtime_r(&t, &tm) == nullptr)
-        throw(runtime_error("Could not get localtime"));
-    char buffer[100];
-    size_t size = strftime(buffer, sizeof(buffer), "%F %T: ", &tm);
-    return string{buffer, size};
-}
 
 int main(int argc, char** argv) {
     timed_out << fixed << setprecision(3);
