@@ -19,13 +19,7 @@ class TimeBuffer: public std::stringbuf {
     int sync();
   public:
     static std::stringstream full_out;
-    static void flush() {
-        if (full_out.str().empty()) return;
-        std::lock_guard<std::mutex> lock{mutex_out};
-        std::cout << full_out.str();
-        std::cout.flush();
-        full_out.str("");
-    }
+    static void flush();
 };
 
 class TimeStream: public std::ostream {

@@ -19,6 +19,14 @@ string time_string() {
     return string{buffer, size};
 }
 
+void TimeBuffer::flush() {
+    if (full_out.str().empty()) return;
+    std::lock_guard<std::mutex> lock{mutex_out};
+    std::cout << full_out.str();
+    std::cout.flush();
+    full_out.str("");
+}
+
 int TimeBuffer::sync() {
     if (!str().empty()) {
         {
