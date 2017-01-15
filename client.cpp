@@ -32,11 +32,11 @@ uElement const ELEMENT_TOP  = POWN(ROW_FACTOR, ROWS_PER_ELEMENT - 1);
 Element const ELEMENT_MIN = numeric_limits<Element>::min() + ELEMENT_FILL(1);
 Element const ELEMENT_MAX = numeric_limits<Element>::max() - ELEMENT_FILL(1);
 
-thread forked;
-mutex mutex_info;
-Element top_;
-Index mask_rows;
-uint top_offset_;
+STATIC thread forked;
+STATIC mutex mutex_info;
+STATIC Element top_;
+STATIC Index mask_rows;
+STATIC uint top_offset_;
 
 class Connection;
 
@@ -153,7 +153,7 @@ uint State::next_id = 0;
 struct ColInfo {
     uint8_t min=0, max=-1;
 };
-vector<ColInfo> col_info;
+STATIC vector<ColInfo> col_info;
 
 template <typename T1, typename T2>
 inline int cmp(T1 const& left, T2 const& right) {
@@ -358,6 +358,7 @@ void State::readable(ev::io& watcher, int revents) {
         while (pipe_in_.size()) {
             uint cols = pipe_in_[0] & 0xff;
             if (cols == 1) {
+                // A final row that is a tie for current best
                 if (pipe_in_.size() < 1 + sizeof(Index)) break;
                 Index col;
                 memcpy(&col, pipe_in_.data()+1, sizeof(Index));
@@ -365,6 +366,7 @@ void State::readable(ev::io& watcher, int revents) {
                 if (EARLY_MIN && col_info[col].min >= max_cols_)
                     connection_->put_known(col);
             } else if (cols == 0) {
+                // Row finished
                 ++processed_;
                 connection_->put_known(col_);
                 connection_->put4(RESULT, col_);
@@ -372,6 +374,7 @@ void State::readable(ev::io& watcher, int revents) {
                 idle = true;
                 pipe_in_.erase(0, 1);
             } else {
+                // Got a new best
                 uint bytes = 1+(rows+cols-1+7) / 8;
                 if (pipe_in_.size() < bytes) break;
                 connection_->put(SOLUTION, pipe_in_.data(), bytes);
@@ -442,14 +445,13 @@ void State::worker() {
         current_.fill(0);
         current_col_ = col_;
         current_col_rev_ = 0;
-        uint bits = col_;
+        uint shifter = rows-1;
         char buffer[MAX_ROWS+1];
-        for (uint i=0; i<rows; ++i) {
-            uint bit = bits & 1;
+        for (uint i=0; i<rows; ++i, --shifter) {
+            uint bit = (col_ >> shifter) & 1;
             buffer[i] = bit ? '1' : '0';
             side[i] = bit;
-            bits >>= 1;
-            current_col_rev_ = current_col_rev_ << 1 | bit;
+            current_col_rev_ |= bit << i;
             shift(current_, bit);
         }
         buffer[rows] = 0;
@@ -868,11 +870,11 @@ uint State::extend(uint col, bool zero, bool one) {
 
     Index current_col, current_col_rev;
     if (SKIP_FRONT) {
-        current_col = current_col_;
-        current_col_ >>= 1;
+        current_col  = current_col_;
+        current_col_ = current_col_ << 1 & mask_rows;
     }
-    current_col_rev  = current_col_rev_;
-    current_col_rev_ = current_col_rev_ << 1 & mask_rows;
+    current_col_rev = current_col_rev_;
+    current_col_rev_ >>= 1;
 
     shift(current_);
     current2 = current_;
@@ -1000,8 +1002,8 @@ uint State::extend(uint col, bool zero, bool one) {
         }
 
         if (ok[0] || ok[1] || col1 >= max_col_) {
-            if (SKIP_FRONT) current_col_     += top_row;
-            current_col_rev_ += 1;
+            if (SKIP_FRONT) current_col_ += 1;
+            current_col_rev_ += top_row;
             ++current_[ELEMENTS-1];
             side[rows + col] = 1;
             uint m = extend(col1, ok[0], ok[1]);
