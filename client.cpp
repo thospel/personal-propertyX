@@ -92,32 +92,6 @@ class State {
     void show() { show_ = 1; }
     Instruments const& instruments() const { return instruments_; }
   private:
-
-    class IdBuffer: public stringbuf {
-      public:
-        IdBuffer(uint const& id): id_{id} {}
-        ~IdBuffer() { sync(); };
-        int sync() {
-            if (!str().empty()) {
-                {
-                    lock_guard<mutex> lock{mutex_out};
-                    TimeBuffer::full_out << time_string() << "Worker " << id_ << ": " << str();
-                }
-                str("");
-            }
-            return 0;
-        }
-      private:
-        uint const& id_;
-    };
-
-    class IdStream: public ostream {
-      public:
-        IdStream(uint const& id): ostream{&buffer}, buffer{id} {}
-      private:
-        IdBuffer buffer;
-    };
-
     void stop() COLD { io_in_.stop(); }
     void pipe_write(void const* ptr, size_t size);
     void readable(ev::io& watcher, int revents);
@@ -128,7 +102,7 @@ class State {
 
     Column current_;
     vector<Set> sets;
-    IdStream id_out;
+    TimeStream id_out;
     string pipe_in_;
     Connection* const connection_;
     ev::io io_in_;
@@ -249,6 +223,7 @@ class Connection {
 
     // got_*: Received info from server
     inline void got_proto   (uint8_t const* ptr, size_t length);
+    inline void got_id      (uint8_t const* ptr, size_t length);
     inline void got_size    (uint8_t const* ptr, size_t length);
     inline void got_info    (uint8_t const* ptr, size_t length);
     inline void got_threads (uint8_t const* ptr, size_t length);
@@ -291,7 +266,7 @@ ostream& operator<<(ostream& os, Column const& column) {
 }
 
 State::State(Connection* connection):
-    id_out{id_},
+    id_out{"%F %T: Worker " + to_string(next_id) + ": "},
     connection_{connection},
     finished_{0},
     show_{0}
@@ -500,7 +475,7 @@ void State::skip_message(uint col, bool front) {
     for (uint i=0; i<rows; ++i) buffer[i] = side[col+i] ? '1' : '0';
     buffer[rows] = 0;
     id_out << (front ? "Skip front " : "Skip back ") << buffer << " (" << elapsed() << " s)" << endl;
-    // id_out << (fron ? "Skip front " : "Skip back ");
+    // id_out << (front ? "Skip front " : "Skip back ");
     // for (uint i=0; i<rows; ++i) id_out << (side[col+i] ? '1' : '0');
     // id_out << " (" << elapsed() << " s)" << endl;
 }
@@ -1156,9 +1131,13 @@ void Connection::got_proto(uint8_t const* ptr, size_t length) {
 
     if (*ptr != PROTO_VERSION)
         throw(runtime_error("Server speaks protocol version " + to_string(static_cast<uint>(*ptr)) + " while I speak " + to_string(static_cast<uint>(PROTO_VERSION))));
+
     put(ID, id);
     uint8_t message[2] = { PROGRAM_VERSION, static_cast<uint8_t>(nr_threads_) };
     put(PROGRAM, message, sizeof(message));
+}
+
+void Connection::got_id(uint8_t const* ptr, size_t length) {
 }
 
 void Connection::got_size(uint8_t const* ptr, size_t length) {
@@ -1299,6 +1278,10 @@ void Connection::readable(ev::io& watcher, int revents) {
             switch(*ptr++ | phase) {
                 case GET_PROTO | PROTO:
                   got_proto(ptr, length);
+                  phase = GET_ID;
+                  break;
+                case GET_ID | ID:
+                  got_id(ptr, length);
                   phase = GET_SIZE;
                   break;
                 case GET_SIZE | SIZE:
@@ -1447,4 +1430,3 @@ void client(int argc, char** argv) {
     timed_out << "Processing finished" << endl;
     return;
 }
-

@@ -6,4 +6,5 @@ propertyXLatticeCheck
 propertyX.*.txt
 !*/propertyX.*.txt
 *.map
+*.S
 out/

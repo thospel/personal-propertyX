@@ -3,30 +3,35 @@
 # pragma once
 
 #include <iostream>
-#include <sstream>
+#include <string>
 #include <mutex>
+#include <vector>
 
 extern std::mutex mutex_out;
-extern std::string time_string();
 
-class TimeBuffer: public std::stringbuf {
+class TimeBuffer: public std::streambuf {
   public:
+    TimeBuffer(std::string const& format = "%F %T: ");
     ~TimeBuffer() {
         sync();
         flush();
     }
   protected:
     int sync();
+    int overflow(int ch);
   public:
-    static std::stringstream full_out;
+    static std::string full_out;
     static void flush();
+  private:
+    std::string const format_;
+    std::vector<char> buffer_;
 };
 
 class TimeStream: public std::ostream {
   public:
-    TimeStream(): std::ostream{&buffer} {}
+    TimeStream(std::string const& format = "%F %T: "): std::ostream{&buffer_}, buffer_{format} {}
   private:
-    TimeBuffer buffer;
+    TimeBuffer buffer_;
 };
 
 extern TimeStream timed_out;

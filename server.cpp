@@ -207,6 +207,8 @@ void Accept::got_proto(uint8_t const* ptr, size_t length) {
         accepted.erase(fd());
         return;
     }
+
+    put(ID, "");
     put1(SIZE, rows);
     put_known();
     put(FORK);
@@ -264,7 +266,7 @@ void Accept::got_result(uint8_t const* ptr, size_t length) {
     auto elapsed_ = elapsed(now);
     uint ielapsed = elapsed_;
     if (ielapsed >= period || done_work >= nr_work) {
-        timed_out << "col=" << done_work << "/" << nr_work << " (" << 100.*done_work*100./nr_work << "% " << ielapsed << " s, avg=" << total_duration / total_results << ")" << endl;
+        timed_out << "col=" << done_work << "/" << nr_work << " (" << 100.*done_work/nr_work << "% " << ielapsed << " s, avg=" << total_duration / total_results << ")" << endl;
         period = (ielapsed/PERIOD+1)*PERIOD;
     }
 
@@ -771,4 +773,3 @@ void server(int argc, char** argv) {
     out_buffer.fsync();
     out_buffer.close();
 }
-
