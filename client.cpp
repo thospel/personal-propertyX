@@ -461,7 +461,10 @@ void State::worker() {
 
 NOINLINE Set::const_iterator lower_bound(Set::const_iterator begin,
                                          Set::const_iterator end,
-                                         Column& column) {
+                                         Column& column);
+Set::const_iterator lower_bound(Set::const_iterator begin,
+                                Set::const_iterator end,
+                                Column& column) {
     return lower_bound(begin, end, column,
                        [](Column const& left, Column const& right) { return cmp(left, right) < 0; });
 }
@@ -538,15 +541,11 @@ uint State::extend(uint col, bool zero, bool one) {
     }
 
     auto const& set_from = sets[col];
-    auto pos_current = equal_range(set_from.cbegin()+1, set_from.cend()-1, current,
-                                   [](Column const&left, Column const& right) { return cmp(left, right) < 0; });
+    auto pos_current = lower_bound(set_from.cbegin()+1, set_from.cend()-1, current);
     // Early check for in set_from was a slight win but cannot happen anymore
     // However the position is still needed for the subtraction absolute value
-    if (pos_current.first != pos_current.second)
+    if (false && cmp(*pos_current, current) == 0)
         throw(logic_error("Unexpected hit on from"));
-
-    // Early check for sum is a loss
-    // if (check_sum(set_from, pos_current.first, current0)) return col;
 
     auto& set_to = sets[col + 2];
     if (set_to.size() == 0) {
@@ -561,8 +560,8 @@ uint State::extend(uint col, bool zero, bool one) {
     // 4 way merge: {set_from - current} (twice), {set_from} and
     // {set_from + current}
     Element const* RESTRICT ptr_sum    = &set_sum[2][0];
-    Element const* RESTRICT ptr_low1   = &pos_current.first[-1][0];
-    Element const* RESTRICT ptr_low2   = &pos_current.second[0][0];
+    Element const* RESTRICT ptr_low1   = &pos_current[-1][0];
+    Element const* RESTRICT ptr_low2   = &pos_current[0][0];
     Element const* RESTRICT ptr_middle = &set_from[1][0];
     auto from_end = set_from.cend() - 2;
     Column col_low1, col_low2, current2;
@@ -574,19 +573,19 @@ uint State::extend(uint col, bool zero, bool one) {
 
     int c;
     auto pos_from_low2 =
-        lower_bound(pos_current.first, set_from.cend()-1, current2);
+        lower_bound(pos_current, set_from.cend()-1, current2);
     c = cmp(current2, *pos_from_low2);
     if (c == 0) {
         // id_out << "Hit on low2 " << col << endl;
         return col;
     }
     auto skip_begin =
-        (pos_from_low2 - pos_current.first) +
-        (pos_current.first - set_from.cbegin() - 1) * 2;
+        (pos_from_low2 - pos_current) +
+        (pos_current - set_from.cbegin() - 1) * 2;
     if (false) {
         lock_guard<mutex> lock(mutex_out);
         indent(col);
-        cout << "low=" << pos_current.first - set_from.cbegin() - 1 <<
+        cout << "low=" << pos_current - set_from.cbegin() - 1 <<
             ", low2=" << pos_from_low2  - set_from.cbegin() - 1 <<
             ", skip_begin=" << skip_begin << endl;
     }
