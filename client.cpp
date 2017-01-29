@@ -45,17 +45,19 @@ struct Instrument {
     Instrument& operator+=(Instrument const& add) {
         calls   += add.calls;
         success += add.success;
+        merge   += add.merge;
         front   += add.front;
         back    += add.back;
         return *this;
     }
     uint64_t calls   = 0;
     uint64_t success = 0;
+    uint64_t merge   = 0;
     uint64_t front   = 0;
     uint64_t back    = 0;
 };
 ostream& operator<<(ostream& os, Instrument const& instrument) {
-    os << setw(12) << instrument.calls << " " << setw(12) << instrument.success << " " << setw(12) << instrument.front << " " << setw(12) << instrument.back << " " << static_cast<double>(instrument.success) / instrument.calls;
+    os << setw(12) << instrument.calls << " " << setw(12) << instrument.merge << " " << setw(12) << instrument.success << " " << setw(12) << instrument.front << " " << setw(12) << instrument.back << " " << static_cast<double>(instrument.success) / instrument.calls << " " << static_cast<double>(instrument.merge) / instrument.calls;
     return os;
 }
 
@@ -66,6 +68,7 @@ struct Instruments: public array<Instrument, MAX_COLS> {
     }
 };
 ostream& operator<<(ostream& os, Instruments const& instruments) {
+    os << "rows" << setw(11) << "calls" << setw(13) << "merges" << setw(13) << "sucess" << setw(13) << "skip_front" << setw(13) << "skip_back" << setw(6) << "s/c"  << setw(6) << "m/c" << "\n";
     for (uint i=0; i<MAX_COLS; ++i) {
         auto const& instrument = instruments[i];
         if (instrument.calls == 0) break;
@@ -98,7 +101,7 @@ class State {
     void worker();
     NOINLINE void skip_message(uint col, bool front) COLD;
     NOINLINE uint extend(uint row, bool zero = true, bool one = true) HOT;
-    void print(uint rows);
+    void print(uint cols);
 
     Column current_;
     vector<Set> sets;
@@ -111,7 +114,6 @@ class State {
     mutex mutex_col;
     chrono::steady_clock::time_point start_;
     atomic<Index> input_row_;
-    atomic<int> finished_;
     atomic<int> show_;
     Index col_, current_col_, current_col_rev_;
     uint max_col_ = 0;
@@ -268,7 +270,6 @@ ostream& operator<<(ostream& os, Column const& column) {
 State::State(Connection* connection):
     id_out{"%F %T: Worker " + to_string(next_id) + ": "},
     connection_{connection},
-    finished_{0},
     show_{0}
 {
     id_ = next_id++;
@@ -316,9 +317,11 @@ State::State(Connection* connection):
 State::~State() {
     stop();
     if (thread_.joinable()) {
-        finished_  = 1;
-        input_row_ = 0;
-        cv_col.notify_one();
+        {
+            lock_guard<mutex> lock(mutex_col);
+            input_row_ = 0;
+            cv_col.notify_one();
+        }
         thread_.join();
     }
     close(fd_[0]);
@@ -381,7 +384,7 @@ void State::got_work(Index col) {
 void State::pipe_write(void const* data, size_t size) {
     auto ptr = static_cast<char const*>(data);
     while (size) {
-        if (finished_) return;
+        if (input_row_ == 0) return;
         auto rc = write(fd_[1], ptr, size);
         if (rc > 0) {
             ptr  += rc;
@@ -413,7 +416,7 @@ void State::worker() {
     id_out << "ready" << endl;
     start_ = chrono::steady_clock::now();
 
-    while (!finished_) {
+    while (true) {
         cv_col.wait(lock_input, [this]{return input_row_ < nr_rows;});
         col_ = input_row_;
         if (col_ == 0) break;
@@ -443,7 +446,7 @@ void State::worker() {
         uint m = extend(0);
         // This is a slight race, but it doesn't hurt
         // (assuming access to max doesn't tear)
-        if (m < col_info[col_].max && !finished_) {
+        if (m < col_info[col_].max && input_row_) {
             lock_guard<mutex> lock{mutex_info};
             if (m < col_info[col_].max) col_info[col_].max = m;
         }
@@ -489,9 +492,7 @@ uint State::extend(uint col, bool zero, bool one) {
     // id_out << "Extend col " << col << " " << static_cast<int>(side[rows+col-1]) << "\n";
     if (col >= MAX_COLS) throw(range_error("col out of range"));
     auto& instrument = instruments_[col];
-    if (INSTRUMENT) {
-        ++instrument.calls;
-    }
+    if (INSTRUMENT) ++instrument.calls;
     if (show_) {
         show_ = 0;
         for (uint i=0; i<col; ++i) id_out << (side[rows + i] ? 1 : 0) << " ";
@@ -524,7 +525,7 @@ uint State::extend(uint col, bool zero, bool one) {
         }
     }
 
-    if (finished_) return 0;
+    if (input_row_ == 0) return 0;
 
     // Execute subset sum. The new column is added to set {from} giving {to}
     // {sum} is the other set.
@@ -546,6 +547,8 @@ uint State::extend(uint col, bool zero, bool one) {
     // However the position is still needed for the subtraction absolute value
     if (false && cmp(*pos_current, current) == 0)
         throw(logic_error("Unexpected hit on from"));
+
+    if (INSTRUMENT) ++instrument.merge;
 
     auto& set_to = sets[col + 2];
     if (set_to.size() == 0) {
