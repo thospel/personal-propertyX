@@ -3,6 +3,7 @@
 propertyX
 propertyXCheck
 propertyXLatticeCheck
+avxtest
 propertyX.*.txt
 !*/propertyX.*.txt
 *.map

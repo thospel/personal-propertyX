@@ -2,7 +2,7 @@ CXXFLAGS  = -Wall -O3 -march=native -fstrict-aliasing -std=c++14 -g -pthread
 LDFLAGS = -g
 CXX := ccache $(CXX)
 
-all: propertyX propertyXCheck propertyXLatticeCheck
+all: propertyX propertyXCheck propertyXLatticeCheck avxtest
 
 # propertyX.o: propertyX.hpp
 fd_buffer.o server.o: fd_buffer.hpp
