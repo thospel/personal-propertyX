@@ -672,9 +672,7 @@ uint State::extend(uint col, bool zero, bool one) {
 
     auto pos_from_high =
         lower_bound(set_from.cbegin()+1, from_end, from_high);
-    if (true) {
-        // Setting this to false makes the program 10% slower even though
-        // the compare is never true ????
+    if (false) {
         c = cmp(from_high, *pos_from_high);
         if (c == 0) {
             // This never happens. Why ?
