@@ -560,28 +560,44 @@ uint State::extend(uint col, bool zero, bool one) {
         }
     }
 
-    // 4 way merge: {set_from - current} (twice), {set_from} and
-    // {set_from + current}
-    Element const* RESTRICT ptr_sum    = &set_sum[2][0];
-    Element const* RESTRICT ptr_low1   = &pos_current[-1][0];
-    Element const* RESTRICT ptr_low2   = &pos_current[0][0];
-    Element const* RESTRICT ptr_middle = &set_from[1][0];
-    auto from_end = set_from.cend() - 2;
-    Column col_low1, col_low2, current2;
-    for (uint j=0; j<ELEMENTS; ++j) {
-        col_low1[j]  = current[j] - ptr_low1[j];
-        col_low2[j]  = *ptr_low2++ - current[j];
-        current2[j]     = current[j]*2;
-    }
-
-    int c;
-    auto pos_from_low2 =
-        lower_bound(pos_current, set_from.cend()-1, current2);
-    c = cmp(current2, *pos_from_low2);
-    if (c == 0) {
+    Column current2;
+    for (uint j=0; j<ELEMENTS; ++j)
+        current2[j] = current[j]*2;
+    auto pos_from_low2 = lower_bound(pos_current, set_from.cend()-1, current2);
+    if (cmp(current2, *pos_from_low2) == 0) {
         // id_out << "Hit on low2 " << col << endl;
         return col;
     }
+
+    // 4 way merge: {set_from - current} (twice), {set_from} and
+    // {set_from + current}
+    Element const* RESTRICT ptr_sum    = &set_sum[1][0];
+    Element const* RESTRICT ptr_low1   = &pos_current[-1][0];
+    Element const* RESTRICT ptr_low2   = &pos_current[0][0];
+    Element const* RESTRICT ptr_middle = &set_from[1][0];
+    Column col_low1, col_low2;
+    for (uint j=0; j<ELEMENTS; ++j) {
+        col_low1[j] = current[j] - ptr_low1[j];
+        col_low2[j] = *ptr_low2++ - current[j];
+    }
+    Column col_merge;
+    int c = cmp(col_low1, col_low2);
+    if (c < 0) {
+        col_merge = col_low1;
+        ptr_low1 -= ELEMENTS;
+        for (uint j=0; j<ELEMENTS; ++j) 
+            col_low1[j] = current[j] - ptr_low1[j];
+    } else if (c > 0) {
+        col_merge = col_low2;
+        for (uint j=0; j<ELEMENTS; ++j) 
+            col_low2[j] = *ptr_low2++ - current[j];
+    } else if (ptr_low1 >= &set_from[1][0]) {
+        return col;
+    } else {
+        throw(logic_error("Unexpected low1 == low2"));
+        col_merge = col_low1;
+    }
+
     auto skip_begin =
         (pos_from_low2 - pos_current) +
         (pos_current - set_from.cbegin() - 1) * 2;
@@ -602,67 +618,48 @@ uint State::extend(uint col, bool zero, bool one) {
             cout << "col_low1" << col_low1 << "\n";
             indent(col);
             cout << "col_low2" << col_low2 << "\n";
+            indent(col);
+            cout << "col_merge" << col_merge << "\n";
         }
 
-        c = cmp(col_low1, col_low2);
-        if (c == -1) {
-            c = cmp(col_low1, ptr_middle);
-            if (c == -1) {
-                // cout << "LOW1\n";
-                ptr_low1 -= ELEMENTS;
-                for (uint j=0; j<ELEMENTS; ++j) {
-                    *ptr_to++   = col_low1[j];
-                    col_low1[j] = current[j] - ptr_low1[j];
-                }
-                goto SUM_L;
-            }
-            if (c ==  1) goto MIDDLE_L;
-            // low1 == middle
-            // cout << "low1 == middle\n";
-            return col;
-        }
-        if (c ==  1) {
-            c = cmp(col_low2, ptr_middle);
-            if (c == -1) {
-                // cout << "LOW2\n";
-                for (uint j=0; j<ELEMENTS; ++j) {
-                    *ptr_to++   = col_low2[j];
-                    col_low2[j] = *ptr_low2++ - current[j];
-                }
-                goto SUM_L;
-            }
-            if (c ==  1) goto MIDDLE_L;
-            // low2 == middle
-            // cout << "low2 == middle\n";
-            return col;
-        }
-        // low1 == low2
-        // cout << "low1 == low2\n";
-        return col;
-
-      SUM_L:
-        for (int j=-static_cast<int>(ELEMENTS); j<0; ++j) {
-            if (ptr_to[j] > ptr_sum[j]) {
+        c = cmp(ptr_middle, col_merge);
+        if (c < 0) {
+            for (uint j=0; j<ELEMENTS; ++j)
+                *ptr_to++ = *ptr_middle++;
+            // {middle} can never be in {sum} or we would already have found
+            // this on the previous level
+        } else if (c > 0) {
+            while (true) {
+                c = cmp(ptr_sum, col_merge);
+                if (c >= 0) break;
                 ptr_sum += ELEMENTS;
-                goto SUM_L;
             }
-            if (ptr_to[j] < ptr_sum[j]) goto DONE_L;
-        }
-        // sum == to
-        return col;
-
-      MIDDLE_L:
-        // cout << "MIDDLE_L\n";
-        for (uint j=0; j<ELEMENTS; ++j)
-            *ptr_to++ = *ptr_middle++;
-        // {middle} can never be in {sum} or we would already have found
-        // this on the previous level
-        goto DONE_L;
-
-      DONE_L:;
+            if (c == 0)
+                return col;
+            for (uint j=0; j<ELEMENTS; ++j)
+                *ptr_to++ = col_merge[j];
+            c = cmp(col_low1, col_low2);
+            if (c < 0) {
+                col_merge = col_low1;
+                ptr_low1 -= ELEMENTS;
+                for (uint j=0; j<ELEMENTS; ++j) 
+                    col_low1[j] = current[j] - ptr_low1[j];
+            } else if (c > 0) {
+                col_merge = col_low2;
+                for (uint j=0; j<ELEMENTS; ++j) 
+                    col_low2[j] = *ptr_low2++ - current[j];
+            } else if (ptr_low1 >= &set_from[1][0]) {
+                return col;
+            } else {
+                throw(logic_error("Unexpected low1 == low2"));
+                col_merge = col_low1;
+            }
+        } else
+            return col;
     }
 
-    Element const* RESTRICT ptr_high   = &set_from[1][0];
+    auto from_end = set_from.cend() - 2;
+    Element const* RESTRICT ptr_high = &set_from[1][0];
     Column from_high, col_high;
     for (uint j=0; j<ELEMENTS; ++j) {
         from_high[j] = (*from_end)[j] - current[j];
@@ -670,8 +667,7 @@ uint State::extend(uint col, bool zero, bool one) {
         col_high[j] = *ptr_high++ + current[j];
     }
 
-    auto pos_from_high =
-        lower_bound(set_from.cbegin()+1, from_end, from_high);
+    auto pos_from_high = lower_bound(set_from.cbegin()+1, from_end, from_high);
     if (false) {
         c = cmp(from_high, *pos_from_high);
         if (c == 0) {
@@ -694,6 +690,34 @@ uint State::extend(uint col, bool zero, bool one) {
         indent(col);
         cout << "middle=" << (ptr_end-ptr_to)/ELEMENTS << endl;
     }
+    ptr_low2 -= ELEMENTS;
+    if (false && ptr_to < ptr_end) {
+        Column col_test;
+        for (uint j=0; j<ELEMENTS; ++j)
+            col_test[j] = col_merge[j] + current[j];
+        if (cmp(ptr_low2-ELEMENTS, col_test)) {
+            lock_guard<mutex> lock(mutex_out);
+            indent(col);
+            cout << "col_merge" << col_merge << "\n";
+            throw(logic_error("Low2 Offset not 2"));
+        }
+    }
+
+    c = cmp(col_high, col_merge);
+    if (c < 0) {
+        col_low2 = col_merge;
+        col_merge = col_high;
+        for (uint j=0; j<ELEMENTS; ++j)
+            col_high[j] = *ptr_high++ + current[j];
+    } else if (c > 0) {
+        // col_merge = col_low2;
+        for (uint j=0; j<ELEMENTS; ++j) 
+            col_low2[j] = *ptr_low2++ - current[j];
+    } else if (ptr_low2 >= &set_from.cend()[0][0])
+        throw(logic_error("Top reached"));
+    else
+        return col;
+
     while (ptr_to < ptr_end) {
         if (false) {
             lock_guard<mutex> lock(mutex_out);
@@ -701,84 +725,70 @@ uint State::extend(uint col, bool zero, bool one) {
             cout << "col_low2" << col_low2 << "\n";
             indent(col);
             cout << "col_high" << col_high << "\n";
+            indent(col);
+            cout << "col_merge" << col_merge << "\n";
         }
 
-        c = cmp(col_low2, ptr_middle);
-        if (c == -1) {
-            c = cmp(col_low2, col_high);
-            if (c == -1) {
-                // cout << "LOW2\n";
-                for (uint j=0; j<ELEMENTS; ++j) {
-                    *ptr_to++   = col_low2[j];
-                    col_low2[j] = *ptr_low2++ - current[j];
-                }
-                goto SUM;
-            }
-            if (c == 1) goto HIGH;
-            // low2 == high
-            // cout << "low2 == high\n";
-            return col;
-        }
-        if (c ==  1) goto MIDDLE;
-        // low2 == middle
-        // cout << "low2 == middle\n";
-        return col;
-
-      MIDDLE:
-        // cout << "MIDDLE\n";
-        c = cmp(ptr_middle, col_high);
-        if (c == -1) {
-            // cout << "MIDDLE0\n";
+        c = cmp(ptr_middle, col_merge);
+        if (c < 0) {
             for (uint j=0; j<ELEMENTS; ++j)
                 *ptr_to++ = *ptr_middle++;
             // {middle} can never be in {sum} or we would already have found
             // this on the previous level
-            goto DONE;
-        }
-        if (c ==  1) goto HIGH;
-        // middle == high
-        // cout << "middle == high\n";
-        return col;
-
-      HIGH:
-        // cout << "HIGH0\n";
-        for (uint j=0; j<ELEMENTS; ++j) {
-            *ptr_to++ = col_high[j];
-            col_high[j] = *ptr_high++ + current[j];
-        }
-        goto SUM;
-
-      SUM:
-        for (int j=-static_cast<int>(ELEMENTS); j<0; ++j) {
-            if (ptr_to[j] > ptr_sum[j]) {
+        } else if (c > 0) {
+            while (true) {
+                c = cmp(ptr_sum, col_merge);
+                if (c >= 0) break;
                 ptr_sum += ELEMENTS;
-                goto SUM;
             }
-            if (ptr_to[j] < ptr_sum[j]) goto DONE;
-        }
-        // sum == to
-        return col;
-      DONE:;
+            if (c == 0)
+                return col;
+            for (uint j=0; j<ELEMENTS; ++j)
+                *ptr_to++ = col_merge[j];
+
+            c = cmp(col_high, col_low2);
+            if (c < 0) {
+                col_merge = col_high;
+                for (uint j=0; j<ELEMENTS; ++j)
+                    col_high[j] = *ptr_high++ + current[j];
+            } else if (c > 0) {
+                col_merge = col_low2;
+                for (uint j=0; j<ELEMENTS; ++j) 
+                    col_low2[j] = *ptr_low2++ - current[j];
+            } else if (ptr_low2 >= &set_from.cend()[0][0])
+                throw(logic_error("Top reached"));
+            else
+                return col;
+        } else
+            return col;
     }
-    ptr_high -= ELEMENTS;
 
     ptr_end = &set_to[set_to.size()-1][0];
+    ptr_high -= 2*ELEMENTS;
+    if (false && ptr_to < ptr_end) {
+        Column col_test;
+        for (uint j=0; j<ELEMENTS; ++j)
+            col_test[j] = col_merge[j] - current[j];
+        if (cmp(ptr_high, col_test)) {
+            lock_guard<mutex> lock(mutex_out);
+            indent(col);
+            cout << "col_merge" << col_merge << "\n";
+            throw(logic_error("High Offset not 2"));
+        }
+    }
     while (ptr_to < ptr_end) {
         for (uint j=0; j<ELEMENTS; ++j)
-            *ptr_to++ = *ptr_high++ + current[j];
-      SUM_H:
-        for (int j=-static_cast<int>(ELEMENTS); j<0; ++j) {
-            if (ptr_to[j] > ptr_sum[j]) {
-                ptr_sum += ELEMENTS;
-                goto SUM_H;
-            }
-            if (ptr_to[j] < ptr_sum[j]) goto DONE_H;
+            col_high[j] = *ptr_high++ + current[j];
+        while (true) {
+            c = cmp(ptr_sum, col_high);
+            if (c >= 0) break;
+            ptr_sum += ELEMENTS;
         }
-        // sum == to
-        return col;
-      DONE_H:;
+        if (c == 0)
+            return col;
+        for (uint j=0; j<ELEMENTS; ++j)
+            *ptr_to++ = col_high[j];
     }
-
     // New column is OK
 
     if (INSTRUMENT) ++instrument.success;
