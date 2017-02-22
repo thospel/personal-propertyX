@@ -22,6 +22,8 @@ bool const DEBUG_SET  = false;
 bool const SKIP2      = false;
 bool const INSTRUMENT = false;
 bool const EARLY_MIN  = false;
+bool const CHECK_PRELOAD = false;
+bool const CHECK_ORDER = false;
 
 Element constexpr ELEMENT_FILL(Element v = ROW_ZERO, int n = ROWS_PER_ELEMENT) {
     return n ? ELEMENT_FILL(v, n-1) * ROW_FACTOR + v : 0;
@@ -135,6 +137,7 @@ STATIC vector<ColInfo> col_info;
 template <typename T1, typename T2>
 inline int cmp(T1 const& left, T2 const& right) {
     for (uint i=0; i<ELEMENTS; ++i) {
+        // cout << left[i] << " <=> " << right[i] << "\n";
         if (left[i] < right[i]) return -1;
         if (left[i] > right[i]) return  1;
     }
@@ -256,6 +259,7 @@ class Connection {
 
 ostream& operator<<(ostream& os, Column const& column) {
     for (uint i=0; i<ELEMENTS; ++i) {
+        // os << "| " << column[i] << " = ";
         uElement v = column[i] + ELEMENT_FILL();
         for (uint j=0; j<ROWS_PER_ELEMENT; ++j) {
             uint bit = v / ELEMENT_TOP;
@@ -265,6 +269,18 @@ ostream& operator<<(ostream& os, Column const& column) {
         }
     }
     return os;
+}
+
+void indent(uint col) {
+    for (uint i=0; i<col; ++i) cout << "  ";
+}
+
+void show_set(Set const& set, uint col = 0) {
+    lock_guard<mutex> lock{mutex_out};
+    for (auto const& elem: set) {
+        indent(col);
+        cout << elem << "\n";
+    }
 }
 
 State::State(Connection* connection):
@@ -308,10 +324,8 @@ State::State(Connection* connection):
             sets[i][1][j] = ELEMENT_MAX;
         }
     }
-    if (DEBUG_SET) {
-        for (auto const& to: sets[0]) id_out << to << "\n";
-        id_out.flush();
-    }
+    if (DEBUG_SET)
+        show_set(sets[0]);
 }
 
 State::~State() {
@@ -470,10 +484,6 @@ Set::const_iterator lower_bound(Set::const_iterator begin,
                                 Column& column) {
     return lower_bound(begin, end, column,
                        [](Column const& left, Column const& right) { return cmp(left, right) < 0; });
-}
-
-void indent(uint row) {
-    for (uint i=0; i<row; ++i) cout << "  ";
 }
 
 void State::skip_message(uint col, bool front) {
@@ -656,6 +666,10 @@ uint State::extend(uint col, bool zero, bool one) {
             }
         } else
             return col;
+        if (CHECK_ORDER && cmp(ptr_to-2*ELEMENTS, ptr_to-ELEMENTS) >= 0) {
+            show_set(set_to, col);
+            throw(logic_error("Out of order 1"));
+        }
     }
 
     auto from_end = set_from.cend() - 2;
@@ -665,6 +679,10 @@ uint State::extend(uint col, bool zero, bool one) {
         from_high[j] = (*from_end)[j] - current[j];
         *ptr_to++ = current[j];
         col_high[j] = *ptr_high++ + current[j];
+    }
+    if (CHECK_ORDER && cmp(ptr_to-2*ELEMENTS, ptr_to-ELEMENTS) >= 0) {
+        show_set(set_to, col);
+        throw(logic_error("Out of order 2"));
     }
 
     auto pos_from_high = lower_bound(set_from.cbegin()+1, from_end, from_high);
@@ -690,12 +708,11 @@ uint State::extend(uint col, bool zero, bool one) {
         indent(col);
         cout << "middle=" << (ptr_end-ptr_to)/ELEMENTS << endl;
     }
-    ptr_low2 -= ELEMENTS;
-    if (false && ptr_to < ptr_end) {
+    if (CHECK_PRELOAD && ptr_to < ptr_end) {
         Column col_test;
         for (uint j=0; j<ELEMENTS; ++j)
             col_test[j] = col_merge[j] + current[j];
-        if (cmp(ptr_low2-ELEMENTS, col_test)) {
+        if (cmp(ptr_low2-2*ELEMENTS, col_test)) {
             lock_guard<mutex> lock(mutex_out);
             indent(col);
             cout << "col_merge" << col_merge << "\n";
@@ -705,14 +722,19 @@ uint State::extend(uint col, bool zero, bool one) {
 
     c = cmp(col_high, col_merge);
     if (c < 0) {
+        ptr_low2 -= ELEMENTS;
         col_low2 = col_merge;
         col_merge = col_high;
         for (uint j=0; j<ELEMENTS; ++j)
             col_high[j] = *ptr_high++ + current[j];
     } else if (c > 0) {
         // col_merge = col_low2;
-        for (uint j=0; j<ELEMENTS; ++j) 
-            col_low2[j] = *ptr_low2++ - current[j];
+        if (CHECK_PRELOAD) {
+            auto ptr = ptr_low2 - ELEMENTS;
+            for (uint j=0; j<ELEMENTS; ++j) 
+                if (col_low2[j] != *ptr++ - current[j])
+                    throw(logic_error("Low2 Offset not 1"));
+        }
     } else if (ptr_low2 >= &set_from.cend()[0][0])
         throw(logic_error("Top reached"));
     else
@@ -761,11 +783,13 @@ uint State::extend(uint col, bool zero, bool one) {
                 return col;
         } else
             return col;
+        if (CHECK_ORDER && cmp(ptr_to-2*ELEMENTS, ptr_to-ELEMENTS) >= 0)
+            throw(logic_error("Out of order 3"));
     }
 
     ptr_end = &set_to[set_to.size()-1][0];
     ptr_high -= 2*ELEMENTS;
-    if (false && ptr_to < ptr_end) {
+    if (CHECK_PRELOAD && ptr_to < ptr_end) {
         Column col_test;
         for (uint j=0; j<ELEMENTS; ++j)
             col_test[j] = col_merge[j] - current[j];
@@ -788,18 +812,19 @@ uint State::extend(uint col, bool zero, bool one) {
             return col;
         for (uint j=0; j<ELEMENTS; ++j)
             *ptr_to++ = col_high[j];
+        if (CHECK_ORDER && cmp(ptr_to-2*ELEMENTS, ptr_to-ELEMENTS) >= 0)
+            throw(logic_error("Out of order 4"));
     }
+    if (CHECK_ORDER && cmp(ptr_to-ELEMENTS, ptr_to) >= 0)
+        throw(logic_error("Out of order 5"));
+    if (CHECK_ORDER && ptr_to != &set_to.end()[-1][0])
+        throw(logic_error("Unexpected number of elements"));
     // New column is OK
 
     if (INSTRUMENT) ++instrument.success;
 
-    if (DEBUG_SET) {
-        lock_guard<mutex> lock{mutex_out};
-        for (auto const& to: set_to) {
-            indent(col);
-            cout << to << "\n";
-        }
-    }
+    if (DEBUG_SET)
+        show_set(set_to, col);
 
     auto col1 = col+1;
     if (false) {
