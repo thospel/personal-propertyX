@@ -18,6 +18,8 @@
 
 using namespace std;
 
+bool const LOW_REVERSE = true;
+
 STATIC FdBuffer out_buffer(true);
 STATIC ostream info_out{&out_buffer};
 
@@ -697,11 +699,15 @@ void create_work() {
 
     uint count1 = (rows+1) / 2;
     for (uint c = 0; c < count1; ++c) col1[c] = c;
-
     while (count1) {
+        bool low = count1*2 <= rows;
         Index col = 0;
-        for (uint c=0; c<count1; ++c)
-            col |= 1 << col1[c];
+        if (LOW_REVERSE && low)
+            for (uint c=0; c<count1; ++c)
+                col |= top_row >> col1[c];
+        else
+            for (uint c=0; c<count1; ++c)
+                col |= 1 << col1[c];
         if (!result_info[col].is_done())
             col_work.emplace_back(col);
 
@@ -714,7 +720,7 @@ void create_work() {
                 goto DONE;
             }
         }
-        if (count1*2 <= rows) count1 = rows + 1 - count1;
+        if (low) count1 = rows + 1 - count1;
         else count1 = rows - count1;
         for (uint c=0; c<count1; ++c) col1[c] = c;
       DONE:;
